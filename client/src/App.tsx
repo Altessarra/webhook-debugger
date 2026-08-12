@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 
 const API_URL = ''
 const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
+const DISPLAY_ORIGIN = window.location.origin
 
 type CapturedRequest = {
   id: string
@@ -152,7 +153,7 @@ function App() {
             )}
           </div>
           <code className="text-xs text-orange-400 break-all">
-            {API_URL}/i/{inboxId}
+            {DISPLAY_ORIGIN}/i/{inboxId}
           </code>
         </div>
         <div className="flex-1 overflow-y-auto">
@@ -162,12 +163,12 @@ function App() {
               <div className="bg-neutral-900 rounded-lg p-3">
                 <p className="text-xs text-neutral-500 mb-1">Try it:</p>
                 <code className="text-xs text-orange-400 break-all block mb-2">
-                  curl -X POST {API_URL}/i/{inboxId} -H "Content-Type: application/json" -d "{"{"}\"hello\":\"world\"{"}"}"
+                  curl -X POST {DISPLAY_ORIGIN}/i/{inboxId} -H "Content-Type: application/json" -d "{"{"}\"hello\":\"world\"{"}"}"
                 </code>
                 <button
                   onClick={() =>
                     navigator.clipboard.writeText(
-                      `curl -X POST ${API_URL}/i/${inboxId} -H "Content-Type: application/json" -d "{\\"hello\\":\\"world\\"}"`
+                      `curl -X POST ${DISPLAY_ORIGIN}/i/${inboxId} -H "Content-Type: application/json" -d "{\\"hello\\":\\"world\\"}"`
                     )
                   }
                   className="text-xs text-neutral-400 hover:text-white transition"
