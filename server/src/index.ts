@@ -1,4 +1,5 @@
 import Fastify from 'fastify';
+import fs from 'fs';
 import path from 'path';
 import fastifyStatic from '@fastify/static';
 import cors from '@fastify/cors';
@@ -7,6 +8,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { nanoid } from 'nanoid';
 
 import { createInbox, getInbox, insertRequest, getRequestsForInbox, getRequestById } from './db';
+import { getSafeHeaders, resolveSafeDestination, validateManualRequest } from './manualRequest';
 
 const fastify = Fastify({ logger: true });
 
@@ -16,9 +18,10 @@ fastify.register(cors, {
   origin: allowedOrigin,
 });
 
-fastify.register(fastifyStatic, {
-  root: path.join(__dirname, '../public'),
-});
+const publicRoot = path.join(__dirname, '../public');
+if (fs.existsSync(publicRoot)) {
+  fastify.register(fastifyStatic, { root: publicRoot });
+}
 
 // Track WS connections per inbox: inboxId -> Set of sockets
 const inboxSubscribers = new Map<string, Set<WebSocket>>();
@@ -57,6 +60,22 @@ fastify.get('/api/inboxes/:id/requests', async (request, reply) => {
 fastify.post('/api/replay', async (request, reply) => {
   const { requestId, targetUrl } = request.body as { requestId: string; targetUrl: string };
 
+  if (!requestId || !targetUrl) {
+    reply.code(400);
+    return { success: false, error: 'Request ID and target URL are required' };
+  }
+
+  let destination: URL;
+  try {
+    destination = new URL(targetUrl);
+    if (!['http:', 'https:'].includes(destination.protocol)) {
+      throw new Error('Target URL must use http or https');
+    }
+  } catch (err) {
+    reply.code(400);
+    return { success: false, error: (err as Error).message };
+  }
+
   const captured = getRequestById(requestId);
   if (!captured) {
     reply.code(404);
@@ -65,14 +84,29 @@ fastify.post('/api/replay', async (request, reply) => {
 
   try {
     const headers = JSON.parse(captured.headers);
-    // Strip headers that shouldn't be forwarded as-is
-    delete headers.host;
-    delete headers['content-length'];
+    // Strip hop-by-hop and browser transport headers before forwarding.
+    for (const header of [
+      'connection',
+      'content-length',
+      'host',
+      'keep-alive',
+      'proxy-authenticate',
+      'proxy-authorization',
+      'te',
+      'trailer',
+      'transfer-encoding',
+      'upgrade',
+    ]) {
+      delete headers[header];
+    }
 
-    const res = await fetch(targetUrl, {
+    const canHaveBody = !['GET', 'HEAD'].includes(captured.method);
+
+    const res = await fetch(destination, {
       method: captured.method,
       headers,
-      body: captured.body ?? undefined,
+      ...(canHaveBody && captured.body !== null ? { body: captured.body } : {}),
+      signal: AbortSignal.timeout(15_000),
     });
 
     return {
@@ -81,8 +115,53 @@ fastify.post('/api/replay', async (request, reply) => {
       statusText: res.statusText,
     };
   } catch (err) {
-    reply.code(500);
-    return { success: false, error: (err as Error).message };
+    reply.code(502);
+    return { success: false, error: `Unable to reach target: ${(err as Error).message}` };
+  }
+});
+
+// Send a user-authored test request directly to an external webhook.
+fastify.post('/api/send', async (request, reply) => {
+  const input = request.body as { method?: string; targetUrl?: string; headers?: string; body?: string };
+  const method = input.method ?? '';
+  const targetUrl = input.targetUrl ?? '';
+  const headers = input.headers ?? '{}';
+  const body = input.body ?? '';
+  const validationError = validateManualRequest({ method, targetUrl, headers, body });
+  if (validationError) {
+    reply.code(400);
+    return { success: false, error: validationError };
+  }
+
+  const resolved = await resolveSafeDestination(targetUrl);
+  if (resolved.error) {
+    reply.code(400);
+    return { success: false, error: resolved.error };
+  }
+
+  try {
+    const hasBody = body.trim().length > 0;
+    const startedAt = Date.now();
+    const response = await fetch(resolved.destination, {
+      method,
+      headers: getSafeHeaders(headers),
+      ...(hasBody ? { body } : {}),
+      signal: AbortSignal.timeout(15_000),
+    });
+    const responseBody = await response.text();
+    const responseHeaders = Object.fromEntries(response.headers.entries());
+
+    return {
+      success: true,
+      status: response.status,
+      statusText: response.statusText,
+      responseBody,
+      responseHeaders,
+      durationMs: Date.now() - startedAt,
+    };
+  } catch (err) {
+    reply.code(502);
+    return { success: false, error: `Unable to reach target: ${(err as Error).message}` };
   }
 });
 
@@ -142,6 +221,15 @@ fastify.all('/i/:inboxId', async (request, reply) => {
   broadcastToInbox(inboxId, { type: 'new_request', request: captured });
 
   return { received: true, id: reqId };
+});
+
+// Let BrowserRouter handle direct navigation to frontend pages in production.
+fastify.setNotFoundHandler(async (request, reply) => {
+  const isApiPath = request.url === '/api' || request.url.startsWith('/api/');
+  const isWebhookPath = request.url === '/i' || request.url.startsWith('/i/');
+  const isFrontendPath = request.method === 'GET' && !isApiPath && !isWebhookPath;
+  if (isFrontendPath) return reply.sendFile('index.html');
+  return reply.code(404).send({ error: 'Not found' });
 });
 
 const start = async () => {

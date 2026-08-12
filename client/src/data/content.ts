@@ -1,0 +1,18 @@
+export const uiCopy = {
+  appName: 'Webhook Debugger',
+  landingKicker: 'A quiet place to inspect noisy systems',
+  landingTitle: 'Inspect your webhooks.',
+  landingDescription: 'Create an inbox, send a request, and see exactly what arrived — headers, query, and payload included.',
+  createInbox: 'Create inbox',
+  newInbox: 'New inbox',
+  emptyInspector: 'Choose a request to inspect.',
+  emptyInspectorDescription: 'Captured requests will appear here with their raw payload ready to read, copy, and replay.',
+  requestHistory: 'Request history',
+  waitingForRequests: 'Waiting for requests.',
+  waitingDescription: 'Send a webhook to the endpoint above. New requests will arrive here in real time.',
+  copy: 'Copy',
+  copied: 'Copied',
+  replay: 'Replay',
+  replayPlaceholder: 'https://your-endpoint.com/webhook',
+  noData: 'No data received',
+} as const
