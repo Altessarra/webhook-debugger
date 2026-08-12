@@ -10,8 +10,10 @@ import { createInbox, getInbox, insertRequest, getRequestsForInbox, getRequestBy
 
 const fastify = Fastify({ logger: true });
 
+const allowedOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
+
 fastify.register(cors, {
-  origin: 'http://localhost:5173',
+  origin: allowedOrigin,
 });
 
 fastify.register(fastifyStatic, {

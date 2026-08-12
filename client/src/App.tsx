@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 
-const API_URL = 'http://localhost:3000'
-const WS_URL = 'ws://localhost:3000'
+const API_URL = ''
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
 
 type CapturedRequest = {
   id: string
