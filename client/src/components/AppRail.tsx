@@ -28,7 +28,7 @@ export function AppRail({ theme: controlledTheme, onToggleTheme: controlledToggl
   return (
     <aside className="app-rail">
       <NavLink to="/requests" className="rail-logo" aria-label="Open requests">
-        W<br />D
+        &lt;/&gt;
       </NavLink>
       <nav aria-label="Primary navigation">
         {navigation.map((item) => (
