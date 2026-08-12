@@ -1,29 +1,39 @@
-import { useEffect, useState } from 'react'
-import { NavLink } from 'react-router-dom'
-import { Icon } from './Icon'
-import type { Theme } from '../types/theme'
+import { useEffect, useState } from "react";
+import { NavLink } from "react-router-dom";
+import { Icon } from "./Icon";
+import type { Theme } from "../types/theme";
 
 const navigation = [
-  { to: '/requests', label: 'Requests', icon: 'database' as const },
-  { to: '/code', label: 'Code', icon: 'code' as const },
-  { to: '/settings', label: 'Settings', icon: 'gear' as const },
-]
+  { to: "/requests", label: "Requests", icon: "database" as const },
+  { to: "/code", label: "Code", icon: "code" as const },
+  { to: "/settings", label: "Settings", icon: "gear" as const },
+];
 
-export function AppRail({ theme: controlledTheme, onToggleTheme: controlledToggle }: { theme?: Theme; onToggleTheme?: () => void } = {}) {
+export function AppRail({
+  theme: controlledTheme,
+  onToggleTheme: controlledToggle,
+}: { theme?: Theme; onToggleTheme?: () => void } = {}) {
+  const [profileOpen, setProfileOpen] = useState(false);
   const [localTheme, setLocalTheme] = useState<Theme>(() => {
-    const saved = window.localStorage.getItem('webhook-debugger:theme')
-    return saved === 'light' || saved === 'dark' ? saved : 'dark'
-  })
-  const theme = controlledTheme ?? localTheme
-  const onToggleTheme = controlledToggle ?? (() => {
-    const nextTheme = theme === 'dark' ? 'light' : 'dark'
-    setLocalTheme(nextTheme)
-    window.dispatchEvent(new CustomEvent<Theme>('webhook-debugger:theme-change', { detail: nextTheme }))
-  })
+    const saved = window.localStorage.getItem("webhook-debugger:theme");
+    return saved === "light" || saved === "dark" ? saved : "dark";
+  });
+  const theme = controlledTheme ?? localTheme;
+  const onToggleTheme =
+    controlledToggle ??
+    (() => {
+      const nextTheme = theme === "dark" ? "light" : "dark";
+      setLocalTheme(nextTheme);
+      window.dispatchEvent(
+        new CustomEvent<Theme>("webhook-debugger:theme-change", {
+          detail: nextTheme,
+        }),
+      );
+    });
 
   useEffect(() => {
-    if (!controlledTheme) document.documentElement.dataset.theme = localTheme
-  }, [controlledTheme, localTheme])
+    if (!controlledTheme) document.documentElement.dataset.theme = localTheme;
+  }, [controlledTheme, localTheme]);
 
   return (
     <aside className="app-rail">
@@ -33,10 +43,12 @@ export function AppRail({ theme: controlledTheme, onToggleTheme: controlledToggl
       <nav aria-label="Primary navigation">
         {navigation.map((item) => (
           <NavLink
-            end={item.to === '/requests'}
+            end={item.to === "/requests"}
             key={item.to}
             to={item.to}
-            className={({ isActive }) => `rail-button ${isActive ? 'rail-button-active' : ''}`}
+            className={({ isActive }) =>
+              `rail-button ${isActive ? "rail-button-active" : ""}`
+            }
             aria-label={item.label}
             title={item.label}
           >
@@ -45,14 +57,52 @@ export function AppRail({ theme: controlledTheme, onToggleTheme: controlledToggl
         ))}
       </nav>
       <div className="rail-bottom">
-        <NavLink to="/help" className={({ isActive }) => `rail-button ${isActive ? 'rail-button-active' : ''}`} aria-label="Help" title="Help">
+        <NavLink
+          to="/help"
+          className={({ isActive }) =>
+            `rail-button ${isActive ? "rail-button-active" : ""}`
+          }
+          aria-label="Help"
+          title="Help"
+        >
           <Icon name="help" className="h-5 w-5" />
         </NavLink>
-        <button type="button" className="rail-button" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`} onClick={onToggleTheme}>
+        <button
+          type="button"
+          className="rail-button"
+          aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+          title={`Switch to ${theme === "dark" ? "light" : "dark"} theme`}
+          onClick={onToggleTheme}
+        >
           <Icon name="sun" className="h-5 w-5" />
         </button>
-        <span className="rail-avatar" aria-hidden="true">A</span>
+        <div className="rail-profile">
+          <button
+            type="button"
+            className="rail-avatar"
+            aria-label="Open workspace menu"
+            aria-expanded={profileOpen}
+            onClick={() => setProfileOpen((current) => !current)}
+          >
+            A
+          </button>
+          {profileOpen && (
+            <div className="rail-popover rail-profile-popover">
+              <strong>Local workspace</strong>
+              <span>No account connected</span>
+              <button
+                type="button"
+                onClick={() => {
+                  onToggleTheme();
+                  setProfileOpen(false);
+                }}
+              >
+                Switch to {theme === "dark" ? "light" : "dark"} theme
+              </button>
+            </div>
+          )}
+        </div>
       </div>
     </aside>
-  )
+  );
 }

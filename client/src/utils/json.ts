@@ -1,8 +1,8 @@
 export function parseJsonValue(value: string | null | undefined): unknown {
-  if (!value) return null
+  if (!value) return null;
   try {
-    return JSON.parse(value)
+    return JSON.parse(value);
   } catch {
-    return value
+    return value;
   }
 }

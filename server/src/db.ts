@@ -1,13 +1,13 @@
-import Database from 'better-sqlite3';
-import fs from 'fs';
-import path from 'path';
+import Database from "better-sqlite3";
+import fs from "fs";
+import path from "path";
 
 const dataDir = process.env.DATA_DIR || process.cwd();
 fs.mkdirSync(dataDir, { recursive: true });
-const dbPath = path.join(dataDir, 'webhook-debugger.db');
+const dbPath = path.join(dataDir, "webhook-debugger.db");
 export const db = new Database(dbPath);
 
-db.pragma('journal_mode = WAL');
+db.pragma("journal_mode = WAL");
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS inboxes (
@@ -31,12 +31,12 @@ db.exec(`
 `);
 
 export function createInbox(id: string) {
-  const stmt = db.prepare('INSERT INTO inboxes (id, created_at) VALUES (?, ?)');
+  const stmt = db.prepare("INSERT INTO inboxes (id, created_at) VALUES (?, ?)");
   stmt.run(id, Date.now());
 }
 
 export function getInbox(id: string) {
-  return db.prepare('SELECT * FROM inboxes WHERE id = ?').get(id);
+  return db.prepare("SELECT * FROM inboxes WHERE id = ?").get(id);
 }
 
 export function insertRequest(req: {
@@ -52,15 +52,28 @@ export function insertRequest(req: {
     INSERT INTO requests (id, inbox_id, method, path, headers, body, query, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `);
-  stmt.run(req.id, req.inboxId, req.method, req.path, req.headers, req.body, req.query, Date.now());
+  stmt.run(
+    req.id,
+    req.inboxId,
+    req.method,
+    req.path,
+    req.headers,
+    req.body,
+    req.query,
+    Date.now(),
+  );
 }
 
 export function getRequestsForInbox(inboxId: string) {
-  return db.prepare('SELECT * FROM requests WHERE inbox_id = ? ORDER BY created_at DESC').all(inboxId);
+  return db
+    .prepare(
+      "SELECT * FROM requests WHERE inbox_id = ? ORDER BY created_at DESC",
+    )
+    .all(inboxId);
 }
 
 export function getRequestById(id: string) {
-  return db.prepare('SELECT * FROM requests WHERE id = ?').get(id) as
+  return db.prepare("SELECT * FROM requests WHERE id = ?").get(id) as
     | {
         id: string;
         inbox_id: string;
