@@ -31,7 +31,7 @@ Fastify receives /i/:inboxId
                               React updates the UI
 ```
 
-The browser loads request history through `GET /api/inboxes/:id/requests`. While the inbox is open, the frontend connects to the WebSocket server with the inbox ID. Each incoming webhook is written to SQLite and broadcast to the matching subscribers, so the request list updates without a refresh.
+The browser loads request history through `GET /api/inboxes/:id/requests`. While the inbox is open, the fronxtend connects to the WebSocket server with the inbox ID. Each incoming webhook is written to SQLite and broadcast to the matching subscribers, so the request list updates without a refresh.
 
 ## One hard technical decision: WebSocket over polling
 
