@@ -31,6 +31,7 @@
 - Create: `server/src/runtimeConfig.ts`
 - Create: `server/src/rateLimit.ts`
 - Create: `server/src/rateLimit.test.ts`
+- Create: `server/.env.example`
 
 **Interfaces:**
 - `runtimeConfig.ts` exports bounded values for all runtime limits, including `rateLimitWindowMs`, route limits, `maxRateLimitKeys`, `historyDefaultPageSize`, `requestRetentionHours`, `retentionCleanupIntervalMs`, `maxRequestsPerInbox`, `wsMaxConnectionsPerIp`, `wsHeartbeatIntervalMs`, `wsIdleTimeoutMs`, and `wsMaxPayloadBytes`.
@@ -69,7 +70,7 @@ npx tsx --test src/rateLimit.test.ts
 
 Expected: failures because `runtimeConfig.ts` and `rateLimit.ts` do not yet exist.
 
-- [ ] **Step 3: Implement bounded parsing.** Parse positive integers with explicit minimum and maximum values; use the documented defaults when values are missing, malformed, zero, negative, fractional, or outside bounds. Keep the hard history cap at 100 in code.
+- [ ] **Step 3: Implement bounded parsing.** Parse positive integers with explicit minimum and maximum values; use the documented defaults when values are missing, malformed, zero, negative, fractional, or outside bounds. Keep the hard history cap at 100 in code, and document every environment variable, default, and bound in `server/.env.example`.
 
 - [ ] **Step 4: Implement the fixed-window limiter.** Key counters by policy key, calculate `retryAfterSeconds` as `max(1, ceil((windowEnd - now) / 1000))`, remove expired keys before admitting a new key, and refuse new keys when `maxKeys` is reached without growing an unbounded map.
 
@@ -85,7 +86,7 @@ npx tsx --test src/rateLimit.test.ts
 - [ ] **Step 6: Commit only the runtime configuration and limiter files.**
 
 ```text
-git add server/src/runtimeConfig.ts server/src/rateLimit.ts server/src/rateLimit.test.ts
+git add server/src/runtimeConfig.ts server/src/rateLimit.ts server/src/rateLimit.test.ts server/.env.example
 git commit -m "feat: add bounded runtime limits"
 ```
 
