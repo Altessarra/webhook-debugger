@@ -33,7 +33,11 @@ import type {
 } from "./types/webhook";
 import type { Theme } from "./types/theme";
 import { parseJsonValue } from "./utils/json";
-import { isCurrentHistoryRequest } from "./utils/historyRequestGuard";
+import {
+  invalidateHistoryLoading,
+  isCurrentHistoryRequest,
+  settleHistoryLoading,
+} from "./utils/historyRequestGuard";
 import { addInboxId, parseInboxIds } from "./utils/inboxSession";
 import { resizePaneWidth } from "./utils/paneResize";
 import { appendRequestPage } from "./utils/requestPagination";
@@ -244,6 +248,10 @@ function App() {
   const activeInboxIdRef = useRef(inboxId);
   const historyRequestGenerationRef = useRef(0);
   const selectedRequestIdRef = useRef<string | null>(null);
+  const invalidateHistoryRequests = useCallback(() => {
+    historyRequestGenerationRef.current += 1;
+    invalidateHistoryLoading({ setHistoryLoading, setLoadingOlder });
+  }, []);
   const [replayUrl, setReplayUrl] = useState("");
   const [replaying, setReplaying] = useState(false);
   const [replayResult, setReplayResult] = useState<{
@@ -373,7 +381,7 @@ function App() {
     const handlePause = (event: Event) =>
       setPaused((event as CustomEvent<boolean>).detail);
     const handleClearHistory = () => {
-      historyRequestGenerationRef.current += 1;
+      invalidateHistoryRequests();
       setRequests([]);
       setNextHistoryCursor(null);
       selectedRequestIdRef.current = null;
@@ -392,7 +400,7 @@ function App() {
         handleClearHistory,
       );
     };
-  }, []);
+  }, [invalidateHistoryRequests]);
 
   useEffect(() => {
     const handleFormatClick = (event: Event) => {
@@ -456,7 +464,7 @@ function App() {
       const data = (await res.json()) as { id: string };
       if (!data.id) throw new Error("The server returned an invalid inbox");
       activeInboxIdRef.current = data.id;
-      historyRequestGenerationRef.current += 1;
+      invalidateHistoryRequests();
       setRequests([]);
       setNextHistoryCursor(null);
       selectedRequestIdRef.current = null;
@@ -560,19 +568,26 @@ function App() {
             current.filter((id) => id !== initiatingInboxId),
           );
           activeInboxIdRef.current = null;
-          historyRequestGenerationRef.current += 1;
+          invalidateHistoryRequests();
           selectedRequestIdRef.current = null;
           setInboxId(null);
           navigate("/");
         }
       })
       .finally(() => {
-        if (isCurrentRequest()) setHistoryLoading(false);
+        settleHistoryLoading("initial", isCurrentRequest(), {
+          setHistoryLoading,
+          setLoadingOlder,
+        });
       });
     return () => {
+      settleHistoryLoading("initial", isCurrentRequest(), {
+        setHistoryLoading,
+        setLoadingOlder,
+      });
       cancelled = true;
     };
-  }, [inboxId, navigate]);
+  }, [inboxId, invalidateHistoryRequests, navigate]);
 
   const loadOlderRequests = async () => {
     if (!inboxId || !nextHistoryCursor || loadingOlder) return;
@@ -613,7 +628,10 @@ function App() {
         err instanceof Error ? err.message : "Unable to load older requests",
       );
     } finally {
-      if (isCurrentRequest()) setLoadingOlder(false);
+      settleHistoryLoading("older", isCurrentRequest(), {
+        setHistoryLoading,
+        setLoadingOlder,
+      });
     }
   };
 
@@ -670,7 +688,7 @@ function App() {
     (nextInboxId: string) => {
       if (nextInboxId === inboxId) return;
       activeInboxIdRef.current = nextInboxId;
-      historyRequestGenerationRef.current += 1;
+      invalidateHistoryRequests();
       setRequests([]);
       setNextHistoryCursor(null);
       selectedRequestIdRef.current = null;
@@ -680,7 +698,7 @@ function App() {
       setInboxId(nextInboxId);
       navigate("/requests");
     },
-    [inboxId, navigate],
+    [inboxId, invalidateHistoryRequests, navigate],
   );
 
   useEffect(() => {
