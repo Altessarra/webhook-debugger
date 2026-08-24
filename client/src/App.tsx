@@ -28,11 +28,13 @@ import type {
   CapturedRequest,
   ConnectionState,
   CopyTarget,
+  RequestHistoryResponse,
 } from "./types/webhook";
 import type { Theme } from "./types/theme";
 import { parseJsonValue } from "./utils/json";
 import { addInboxId, parseInboxIds } from "./utils/inboxSession";
 import { resizePaneWidth } from "./utils/paneResize";
+import { appendRequestPage } from "./utils/requestPagination";
 import { nextPayloadFormat, type PayloadFormat } from "./utils/uiState";
 
 const API_URL = "";
@@ -43,6 +45,7 @@ const DISPLAY_ORIGIN = window.location.origin;
 const INBOX_STORAGE_KEY = "webhook-debugger:inbox-id";
 const INBOX_IDS_STORAGE_KEY = "webhook-debugger:inbox-ids";
 const REQUEST_TIMEOUT_MS = 15000;
+const HISTORY_PAGE_SIZE = 50;
 
 type DetailTab = "overview" | "headers" | "query" | "raw";
 type PayloadTab = "payload" | "schema";
@@ -189,6 +192,10 @@ function App() {
   const [inboxes, setInboxes] = useState<string[]>(getInitialInboxIds);
   const [loading, setLoading] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [nextHistoryCursor, setNextHistoryCursor] = useState<string | null>(
+    null,
+  );
   const [requests, setRequests] = useState<CapturedRequest[]>([]);
   const [selected, setSelected] = useState<CapturedRequest | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
@@ -335,6 +342,7 @@ function App() {
       setPaused((event as CustomEvent<boolean>).detail);
     const handleClearHistory = () => {
       setRequests([]);
+      setNextHistoryCursor(null);
       setSelected(null);
     };
     window.addEventListener("webhook-debugger:pause", handlePause);
@@ -413,6 +421,7 @@ function App() {
       const data = (await res.json()) as { id: string };
       if (!data.id) throw new Error("The server returned an invalid inbox");
       setRequests([]);
+      setNextHistoryCursor(null);
       setSelected(null);
       setInboxes((current) => addInboxId(current, data.id));
       window.dispatchEvent(
@@ -467,7 +476,9 @@ function App() {
           setHistoryLoading(true);
           setError(null);
         }
-        return fetch(`${API_URL}/api/inboxes/${inboxId}/requests`);
+        return fetch(
+          `${API_URL}/api/inboxes/${inboxId}/requests?limit=${HISTORY_PAGE_SIZE}`,
+        );
       })
       .then(async (res) => {
         if (!res.ok)
@@ -476,7 +487,7 @@ function App() {
               ? "This inbox no longer exists"
               : "Unable to load request history",
           );
-        return (await res.json()) as { requests: CapturedRequest[] };
+        return (await res.json()) as RequestHistoryResponse;
       })
       .then((data) => {
         if (!cancelled)
@@ -486,6 +497,7 @@ function App() {
               createdAt: getRequestTime(request),
             })),
           );
+          setNextHistoryCursor(data.nextCursor);
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -506,6 +518,36 @@ function App() {
       cancelled = true;
     };
   }, [inboxId, navigate]);
+
+  const loadOlderRequests = async () => {
+    if (!inboxId || !nextHistoryCursor || loadingOlder) return;
+
+    setLoadingOlder(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `${API_URL}/api/inboxes/${inboxId}/requests?limit=${HISTORY_PAGE_SIZE}&cursor=${encodeURIComponent(nextHistoryCursor)}`,
+      );
+      if (!response.ok) throw new Error("Unable to load older requests");
+
+      const page = (await response.json()) as RequestHistoryResponse;
+      const normalizedPage = {
+        ...page,
+        requests: page.requests.map((request) => ({
+          ...request,
+          createdAt: getRequestTime(request),
+        })),
+      };
+      setRequests((current) => appendRequestPage(current, normalizedPage).requests);
+      setNextHistoryCursor(normalizedPage.nextCursor);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Unable to load older requests",
+      );
+    } finally {
+      setLoadingOlder(false);
+    }
+  };
 
   useEffect(() => {
     if (!inboxId) return;
@@ -554,6 +596,7 @@ function App() {
     (nextInboxId: string) => {
       if (nextInboxId === inboxId) return;
       setRequests([]);
+      setNextHistoryCursor(null);
       setSelected(null);
       setError(null);
       setInboxId(nextInboxId);
@@ -581,19 +624,24 @@ function App() {
       const res = await fetch(`${API_URL}/api/replay`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId: selected.id, targetUrl: replayUrl }),
+        body: JSON.stringify({
+          inboxId,
+          requestId: selected.id,
+          targetUrl: replayUrl,
+        }),
       });
       const data = (await res.json()) as {
         success?: boolean;
         status?: number;
         statusText?: string;
+        redirected?: boolean;
         error?: string;
       };
       if (!res.ok || !data.success)
         throw new Error(data.error ?? "Replay failed");
       setReplayResult({
         success: true,
-        message: `${data.status} ${data.statusText}`,
+        message: `${data.status} ${data.statusText}${data.redirected ? " · redirect not followed" : ""}`,
       });
     } catch (err) {
       setReplayResult({
@@ -654,6 +702,7 @@ function App() {
         success?: boolean;
         status?: number;
         statusText?: string;
+        redirected?: boolean;
         error?: string;
         responseBody?: string;
         responseHeaders?: Record<string, string>;
@@ -666,6 +715,7 @@ function App() {
         message: `${data.status} ${data.statusText}`,
         status: data.status,
         statusText: data.statusText,
+        redirected: data.redirected,
         responseBody: data.responseBody,
         responseHeaders: data.responseHeaders,
         durationMs: data.durationMs,
@@ -918,6 +968,9 @@ function App() {
           inboxId={inboxId}
           webhookUrl={webhookUrl}
           connection={connection}
+          hasOlder={nextHistoryCursor !== null}
+          loadingOlder={loadingOlder}
+          onLoadOlder={() => void loadOlderRequests()}
           copied={copyTarget === "url"}
           onCopyUrl={() => copyText(webhookUrl, "url")}
         />

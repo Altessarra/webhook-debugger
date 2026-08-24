@@ -1,4 +1,8 @@
-import Fastify from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyReply,
+  type FastifyRequest,
+} from "fastify";
 import fs from "fs";
 import path from "path";
 import fastifyStatic from "@fastify/static";
@@ -9,31 +13,61 @@ import { nanoid } from "nanoid";
 
 import {
   createInbox,
+  decodeRequestCursor,
+  deleteExpiredRequests,
   getInbox,
-  insertRequest,
-  getRequestsForInbox,
   getRequestById,
+  getRequestsForInbox,
+  insertRequest,
+  pruneInboxRequests,
 } from "./db";
+import { getSafeHeaders, validateManualRequest } from "./manualRequest";
 import {
-  getSafeHeaders,
-  resolveSafeDestination,
-  validateManualRequest,
-} from "./manualRequest";
+  executeOutboundRequest,
+  filterReplayHeaders,
+  isOutboundRedirect,
+  isRequestOwnedByInbox,
+  OutboundCapacityError,
+  OutboundDestinationError,
+  OutboundResponseTooLargeError,
+  OutboundTimeoutError,
+  parseReplayInput,
+} from "./outbound";
+import { FixedWindowLimiter } from "./rateLimit";
+import {
+  historyDefaultPageSize,
+  historyReadRateLimit,
+  inboxCreationRateLimit,
+  manualSendRateLimit,
+  maxRateLimitKeys,
+  maxRequestsPerInbox,
+  rateLimitWindowMs,
+  replayRateLimit,
+  requestRetentionHours,
+  retentionCleanupIntervalMs,
+  webhookIngestionRateLimit,
+} from "./runtimeConfig";
 
-const fastify = Fastify({ logger: true });
+type RoutePolicy =
+  | "inbox-create"
+  | "webhook-ingest"
+  | "history-read"
+  | "manual-send"
+  | "replay";
 
-const allowedOrigin = process.env.CORS_ORIGIN || "http://localhost:5173";
+type BuildServerOptions = {
+  now?: () => number;
+  rateLimits?: Partial<Record<RoutePolicy, number>>;
+};
 
-fastify.register(cors, {
-  origin: allowedOrigin,
-});
+const defaultRateLimits: Record<RoutePolicy, number> = {
+  "inbox-create": inboxCreationRateLimit,
+  "webhook-ingest": webhookIngestionRateLimit,
+  "history-read": historyReadRateLimit,
+  "manual-send": manualSendRateLimit,
+  replay: replayRateLimit,
+};
 
-const publicRoot = path.join(__dirname, "../public");
-if (fs.existsSync(publicRoot)) {
-  fastify.register(fastifyStatic, { root: publicRoot });
-}
-
-// Track WS connections per inbox: inboxId -> Set of sockets
 const inboxSubscribers = new Map<string, Set<WebSocket>>();
 
 function broadcastToInbox(inboxId: string, data: unknown) {
@@ -41,304 +75,354 @@ function broadcastToInbox(inboxId: string, data: unknown) {
   if (!subscribers) return;
   const payload = JSON.stringify(data);
   for (const socket of subscribers) {
-    if (socket.readyState === WebSocket.OPEN) {
-      socket.send(payload);
-    }
+    if (socket.readyState === WebSocket.OPEN) socket.send(payload);
   }
 }
 
-// Create a new inbox
-fastify.post("/api/inboxes", async (request, reply) => {
-  const id = nanoid(10);
-  createInbox(id);
-  return { id };
-});
-
-// Get all requests for an inbox
-fastify.get("/api/inboxes/:id/requests", async (request, reply) => {
-  const { id } = request.params as { id: string };
-  const inbox = getInbox(id);
-  if (!inbox) {
-    reply.code(404);
-    return { error: "Inbox not found" };
-  }
-  const requests = getRequestsForInbox(id);
-  return { requests };
-});
-
-// Replay a captured request to a target URL
-fastify.post("/api/replay", async (request, reply) => {
-  const { requestId, targetUrl } = request.body as {
-    requestId: string;
-    targetUrl: string;
-  };
-
-  if (!requestId || !targetUrl) {
-    reply.code(400);
-    return { success: false, error: "Request ID and target URL are required" };
+function getHistoryPageLimit(value: unknown) {
+  if (typeof value !== "string" || !/^\d+$/.test(value)) {
+    return historyDefaultPageSize;
   }
 
-  let destination: URL;
-  try {
-    destination = new URL(targetUrl);
-    if (!["http:", "https:"].includes(destination.protocol)) {
-      throw new Error("Target URL must use http or https");
-    }
-  } catch (err) {
-    reply.code(400);
-    return { success: false, error: (err as Error).message };
-  }
+  return Math.max(1, Math.min(100, Number(value)));
+}
 
-  const captured = getRequestById(requestId);
-  if (!captured) {
-    reply.code(404);
-    return { error: "Request not found" };
-  }
+function rateLimit(
+  limiter: FixedWindowLimiter,
+  key: string,
+  reply: FastifyReply,
+) {
+  const decision = limiter.check(key);
+  if (decision.allowed) return false;
 
-  try {
-    const headers = JSON.parse(captured.headers);
-    // Strip hop-by-hop and browser transport headers before forwarding.
-    for (const header of [
-      "connection",
-      "content-length",
-      "host",
-      "keep-alive",
-      "proxy-authenticate",
-      "proxy-authorization",
-      "te",
-      "trailer",
-      "transfer-encoding",
-      "upgrade",
-    ]) {
-      delete headers[header];
+  reply.header("Retry-After", String(decision.retryAfterSeconds ?? 1));
+  reply.code(429);
+  return true;
+}
+
+function addWebSocketServer(fastify: FastifyInstance) {
+  const wss = new WebSocketServer({ server: fastify.server });
+
+  wss.on("connection", (socket, req) => {
+    const url = new URL(req.url ?? "", "http://localhost");
+    const inboxId = url.searchParams.get("inboxId");
+    if (!inboxId) {
+      socket.close();
+      return;
     }
 
-    const canHaveBody = !["GET", "HEAD"].includes(captured.method);
-
-    const res = await fetch(destination, {
-      method: captured.method,
-      headers,
-      ...(canHaveBody && captured.body !== null ? { body: captured.body } : {}),
-      signal: AbortSignal.timeout(15_000),
-    });
-
-    return {
-      success: true,
-      status: res.status,
-      statusText: res.statusText,
-    };
-  } catch (err) {
-    reply.code(502);
-    return {
-      success: false,
-      error: `Unable to reach target: ${(err as Error).message}`,
-    };
-  }
-});
-
-// Send a user-authored test request directly to an external webhook.
-fastify.post("/api/send", async (request, reply) => {
-  const input = request.body as {
-    method?: string;
-    targetUrl?: string;
-    headers?: string;
-    body?: string;
-  };
-  const method = input.method ?? "";
-  const targetUrl = input.targetUrl ?? "";
-  const headers = input.headers ?? "{}";
-  const body = input.body ?? "";
-  const validationError = validateManualRequest({
-    method,
-    targetUrl,
-    headers,
-    body,
+    if (!inboxSubscribers.has(inboxId)) {
+      inboxSubscribers.set(inboxId, new Set());
+    }
+    inboxSubscribers.get(inboxId)!.add(socket);
+    socket.on("close", () => inboxSubscribers.get(inboxId)?.delete(socket));
   });
-  if (validationError) {
-    reply.code(400);
-    return { success: false, error: validationError };
+}
+
+export function runRetentionCleanup(fastify: FastifyInstance) {
+  const deleted = deleteExpiredRequests(
+    Date.now() - requestRetentionHours * 60 * 60 * 1000,
+  );
+  fastify.log.info({ deleted }, "Deleted expired requests");
+  return deleted;
+}
+
+function scheduleRetentionCleanup(fastify: FastifyInstance) {
+  runRetentionCleanup(fastify);
+  const timer = setInterval(
+    () => runRetentionCleanup(fastify),
+    retentionCleanupIntervalMs,
+  );
+  timer.unref();
+  fastify.addHook("onClose", () => clearInterval(timer));
+}
+
+export function buildServer(options: BuildServerOptions = {}) {
+  const fastify = Fastify({ logger: true });
+  const allowedOrigin = process.env.CORS_ORIGIN || "http://localhost:5173";
+  const configuredLimits = { ...defaultRateLimits, ...options.rateLimits };
+  const limiters = Object.fromEntries(
+    (Object.keys(configuredLimits) as RoutePolicy[]).map((policy) => [
+      policy,
+      new FixedWindowLimiter({
+        limit: configuredLimits[policy],
+        windowMs: rateLimitWindowMs,
+        maxKeys: maxRateLimitKeys,
+        now: options.now,
+      }),
+    ]),
+  ) as Record<RoutePolicy, FixedWindowLimiter>;
+
+  fastify.register(cors, { origin: allowedOrigin });
+
+  const publicRoot = path.join(__dirname, "../public");
+  if (fs.existsSync(publicRoot)) {
+    fastify.register(fastifyStatic, { root: publicRoot });
   }
 
-  const resolved = await resolveSafeDestination(targetUrl);
-  if (resolved.error) {
-    reply.code(400);
-    return { success: false, error: resolved.error };
-  }
+  fastify.post("/api/inboxes", async (request, reply) => {
+    if (rateLimit(limiters["inbox-create"], request.ip, reply)) {
+      return { error: "Rate limit exceeded" };
+    }
 
-  try {
-    const hasBody = body.trim().length > 0;
-    const startedAt = Date.now();
-    const response = await fetch(resolved.destination, {
+    const id = nanoid(10);
+    createInbox(id);
+    return { id };
+  });
+
+  fastify.get("/api/inboxes/:id/requests", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (rateLimit(limiters["history-read"], id, reply)) {
+      return { error: "Rate limit exceeded" };
+    }
+
+    const inbox = getInbox(id);
+    if (!inbox) {
+      reply.code(404);
+      return { error: "Inbox not found" };
+    }
+
+    const { limit, cursor } = request.query as {
+      limit?: string;
+      cursor?: string;
+    };
+    try {
+      return getRequestsForInbox(id, {
+        limit: getHistoryPageLimit(limit),
+        ...(cursor ? { cursor: decodeRequestCursor(cursor) } : {}),
+      });
+    } catch {
+      reply.code(400);
+      return { error: "Invalid request cursor" };
+    }
+  });
+
+  fastify.post("/api/replay", async (request, reply) => {
+    if (rateLimit(limiters.replay, request.ip, reply)) {
+      return { error: "Rate limit exceeded" };
+    }
+
+    const input = parseReplayInput(request.body);
+    if (!input) {
+      reply.code(400);
+      return {
+        success: false,
+        error: "Inbox ID, request ID, and target URL are required",
+      };
+    }
+
+    const captured = getRequestById(input.requestId);
+    if (!captured || !isRequestOwnedByInbox(captured, input.inboxId)) {
+      reply.code(404);
+      return { error: "Request not found" };
+    }
+
+    try {
+      const headers = filterReplayHeaders(JSON.parse(captured.headers));
+      const canHaveBody = !["GET", "HEAD"].includes(captured.method);
+      const response = await executeOutboundRequest(input.targetUrl, {
+        method: captured.method,
+        headers,
+        ...(canHaveBody && captured.body !== null ? { body: captured.body } : {}),
+      });
+
+      return {
+        success: true,
+        status: response.status,
+        statusText: response.statusText,
+        redirected: isOutboundRedirect(response.status),
+      };
+    } catch (err) {
+      if (err instanceof OutboundDestinationError) reply.code(400);
+      else if (err instanceof OutboundCapacityError) reply.code(429);
+      else if (err instanceof OutboundTimeoutError) reply.code(504);
+      else reply.code(502);
+      return {
+        success: false,
+        error:
+          err instanceof OutboundDestinationError
+            ? err.message
+            : err instanceof OutboundCapacityError
+              ? "Outbound request capacity reached"
+              : err instanceof OutboundTimeoutError
+                ? "Outbound request timed out"
+                : err instanceof OutboundResponseTooLargeError
+                  ? "Target response exceeded the maximum size"
+                  : "Unable to reach target",
+      };
+    }
+  });
+
+  fastify.post("/api/send", async (request, reply) => {
+    if (rateLimit(limiters["manual-send"], request.ip, reply)) {
+      return { error: "Rate limit exceeded" };
+    }
+
+    const input = request.body as {
+      method?: string;
+      targetUrl?: string;
+      headers?: string;
+      body?: string;
+    };
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      reply.code(400);
+      return { success: false, error: "Request body is required" };
+    }
+    const method = input.method ?? "";
+    const targetUrl = input.targetUrl ?? "";
+    const headers = input.headers ?? "{}";
+    const body = input.body ?? "";
+    const validationError = validateManualRequest({
       method,
-      headers: getSafeHeaders(headers),
-      ...(hasBody ? { body } : {}),
-      signal: AbortSignal.timeout(15_000),
+      targetUrl,
+      headers,
+      body,
     });
-    const responseBody = await response.text();
-    const responseHeaders = Object.fromEntries(response.headers.entries());
+    if (validationError) {
+      reply.code(400);
+      return { success: false, error: validationError };
+    }
 
-    return {
-      success: true,
-      status: response.status,
-      statusText: response.statusText,
-      responseBody,
-      responseHeaders,
-      durationMs: Date.now() - startedAt,
+    try {
+      const hasBody = body.trim().length > 0;
+      const startedAt = Date.now();
+      const response = await executeOutboundRequest(targetUrl, {
+        method,
+        headers: getSafeHeaders(headers),
+        ...(hasBody ? { body } : {}),
+      });
+
+      return {
+        success: true,
+        status: response.status,
+        statusText: response.statusText,
+        redirected: isOutboundRedirect(response.status),
+        responseBody: response.body,
+        responseHeaders: response.headers,
+        durationMs: Date.now() - startedAt,
+      };
+    } catch (err) {
+      if (err instanceof OutboundDestinationError) reply.code(400);
+      else if (err instanceof OutboundCapacityError) reply.code(429);
+      else if (err instanceof OutboundTimeoutError) reply.code(504);
+      else reply.code(502);
+      return {
+        success: false,
+        error:
+          err instanceof OutboundDestinationError
+            ? err.message
+            : err instanceof OutboundCapacityError
+              ? "Outbound request capacity reached"
+              : err instanceof OutboundTimeoutError
+                ? "Outbound request timed out"
+                : err instanceof OutboundResponseTooLargeError
+                  ? "Target response exceeded the maximum size"
+                  : "Unable to reach target",
+      };
+    }
+  });
+
+  const captureInboxRequest = async (
+    request: FastifyRequest<{ Params: { inboxId: string } }>,
+    reply: FastifyReply,
+  ) => {
+    const { inboxId } = request.params;
+    if (rateLimit(limiters["webhook-ingest"], inboxId, reply)) {
+      return { error: "Rate limit exceeded" };
+    }
+
+    const inbox = getInbox(inboxId);
+    if (!inbox) {
+      reply.code(404);
+      return { error: "Inbox not found" };
+    }
+
+    const reqId = nanoid();
+    const createdAt = Date.now();
+    const captured = {
+      id: reqId,
+      inboxId,
+      method: request.method,
+      path: request.url,
+      headers: JSON.stringify(request.headers),
+      body: request.body ? JSON.stringify(request.body) : null,
+      query: JSON.stringify(request.query),
+      createdAt,
     };
-  } catch (err) {
-    reply.code(502);
-    return {
-      success: false,
-      error: `Unable to reach target: ${(err as Error).message}`,
-    };
-  }
-});
+    insertRequest(captured);
+    pruneInboxRequests(inboxId, maxRequestsPerInbox);
+    broadcastToInbox(inboxId, { type: "new_request", request: captured });
 
-// Catch-all: accept ANY method/path under /i/:inboxId
-fastify.all("/i/:inboxId/*", async (request, reply) => {
-  const { inboxId } = request.params as { inboxId: string };
-  const inbox = getInbox(inboxId);
-
-  if (!inbox) {
-    reply.code(404);
-    return { error: "Inbox not found" };
-  }
-
-  const reqId = nanoid();
-  const createdAt = Date.now();
-  const captured = {
-    id: reqId,
-    inboxId,
-    method: request.method,
-    path: request.url,
-    headers: JSON.stringify(request.headers),
-    body: request.body ? JSON.stringify(request.body) : null,
-    query: JSON.stringify(request.query),
-    createdAt,
+    return { received: true, id: reqId };
   };
 
-  insertRequest(captured);
-  broadcastToInbox(inboxId, { type: "new_request", request: captured });
+  fastify.all("/i/:inboxId/*", captureInboxRequest);
+  fastify.all("/i/:inboxId", captureInboxRequest);
 
-  return { received: true, id: reqId };
-});
+  fastify.post("/api/verify-stripe-signature", async (request) => {
+    const { payload, signatureHeader, secret } = request.body as {
+      payload: string;
+      signatureHeader: string;
+      secret: string;
+    };
 
-// Handle the root case too: /i/:inboxId with nothing after it
-fastify.all("/i/:inboxId", async (request, reply) => {
-  const { inboxId } = request.params as { inboxId: string };
-  const inbox = getInbox(inboxId);
+    try {
+      const parts = signatureHeader.split(",").reduce(
+        (acc, part) => {
+          const [key, value] = part.split("=");
+          acc[key] = value;
+          return acc;
+        },
+        {} as Record<string, string>,
+      );
+      const timestamp = parts.t;
+      const receivedSignature = parts.v1;
+      if (!timestamp || !receivedSignature) {
+        return {
+          valid: false,
+          reason: "Missing timestamp or v1 signature in header",
+        };
+      }
 
-  if (!inbox) {
-    reply.code(404);
-    return { error: "Inbox not found" };
-  }
+      const expectedSignature = crypto
+        .createHmac("sha256", secret)
+        .update(`${timestamp}.${payload}`)
+        .digest("hex");
+      const valid = crypto.timingSafeEqual(
+        Buffer.from(expectedSignature),
+        Buffer.from(receivedSignature),
+      );
+      return { valid, expectedSignature, receivedSignature };
+    } catch (err) {
+      return { valid: false, reason: (err as Error).message };
+    }
+  });
 
-  const reqId = nanoid();
-  const createdAt = Date.now();
-  const captured = {
-    id: reqId,
-    inboxId,
-    method: request.method,
-    path: request.url,
-    headers: JSON.stringify(request.headers),
-    body: request.body ? JSON.stringify(request.body) : null,
-    query: JSON.stringify(request.query),
-    createdAt,
-  };
+  fastify.setNotFoundHandler(async (request, reply) => {
+    const isApiPath = request.url === "/api" || request.url.startsWith("/api/");
+    const isWebhookPath = request.url === "/i" || request.url.startsWith("/i/");
+    const isFrontendPath = request.method === "GET" && !isApiPath && !isWebhookPath;
+    if (isFrontendPath) return reply.sendFile("index.html");
+    return reply.code(404).send({ error: "Not found" });
+  });
 
-  insertRequest(captured);
-  broadcastToInbox(inboxId, { type: "new_request", request: captured });
+  return fastify;
+}
 
-  return { received: true, id: reqId };
-});
+export const fastify = buildServer();
 
-// Let BrowserRouter handle direct navigation to frontend pages in production.
-fastify.setNotFoundHandler(async (request, reply) => {
-  const isApiPath = request.url === "/api" || request.url.startsWith("/api/");
-  const isWebhookPath = request.url === "/i" || request.url.startsWith("/i/");
-  const isFrontendPath =
-    request.method === "GET" && !isApiPath && !isWebhookPath;
-  if (isFrontendPath) return reply.sendFile("index.html");
-  return reply.code(404).send({ error: "Not found" });
-});
-
-const start = async () => {
+export async function startServer() {
   try {
     await fastify.listen({ port: 3000, host: "0.0.0.0" });
-
-    // Attach WebSocket server to the same HTTP server
-    const wss = new WebSocketServer({ server: fastify.server });
-
-    wss.on("connection", (socket, req) => {
-      const url = new URL(req.url ?? "", "http://localhost");
-      const inboxId = url.searchParams.get("inboxId");
-
-      if (!inboxId) {
-        socket.close();
-        return;
-      }
-
-      if (!inboxSubscribers.has(inboxId)) {
-        inboxSubscribers.set(inboxId, new Set());
-      }
-      inboxSubscribers.get(inboxId)!.add(socket);
-
-      socket.on("close", () => {
-        inboxSubscribers.get(inboxId)?.delete(socket);
-      });
-    });
-
+    addWebSocketServer(fastify);
+    scheduleRetentionCleanup(fastify);
     console.log("Server running on http://localhost:3000");
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);
   }
-};
+}
 
-// Verify a Stripe webhook signature
-fastify.post("/api/verify-stripe-signature", async (request, reply) => {
-  const { payload, signatureHeader, secret } = request.body as {
-    payload: string;
-    signatureHeader: string;
-    secret: string;
-  };
-
-  try {
-    // Stripe-Signature header format: "t=timestamp,v1=signature"
-    const parts = signatureHeader.split(",").reduce(
-      (acc, part) => {
-        const [key, value] = part.split("=");
-        acc[key] = value;
-        return acc;
-      },
-      {} as Record<string, string>,
-    );
-
-    const timestamp = parts["t"];
-    const receivedSignature = parts["v1"];
-
-    if (!timestamp || !receivedSignature) {
-      return {
-        valid: false,
-        reason: "Missing timestamp or v1 signature in header",
-      };
-    }
-
-    const signedPayload = `${timestamp}.${payload}`;
-    const expectedSignature = crypto
-      .createHmac("sha256", secret)
-      .update(signedPayload)
-      .digest("hex");
-
-    const valid = crypto.timingSafeEqual(
-      Buffer.from(expectedSignature),
-      Buffer.from(receivedSignature),
-    );
-
-    return { valid, expectedSignature, receivedSignature };
-  } catch (err) {
-    return { valid: false, reason: (err as Error).message };
-  }
-});
-
-start();
+if (require.main === module) {
+  void startServer();
+}
