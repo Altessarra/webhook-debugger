@@ -11,6 +11,18 @@ export type ManualRequestInput = {
   body: string;
 };
 
+export type ResolvedDestination = {
+  destination: URL;
+  address: string;
+  family: 4 | 6;
+};
+
+export type SafeDestinationResult = ResolvedDestination | { error: string };
+
+export type DestinationLookup = (
+  hostname: string,
+) => Promise<Array<{ address: string; family: 4 | 6 }>>;
+
 const blockedHeaderNames = new Set([
   "connection",
   "content-length",
@@ -46,7 +58,7 @@ function isBlockedIpv4(address: string) {
 }
 
 export function isBlockedAddress(address: string) {
-  const normalized = address.toLowerCase();
+  const normalized = address.toLowerCase().replace(/^\[|\]$/g, "");
   if (isIP(normalized) === 4) return isBlockedIpv4(normalized);
   if (isIP(normalized) !== 6) return false;
   if (
@@ -119,7 +131,19 @@ export function validateManualRequest(input: ManualRequestInput) {
   return null;
 }
 
-export async function resolveSafeDestination(targetUrl: string) {
+async function lookupAllAddresses(hostname: string) {
+  return (await lookup(hostname, { all: true, verbatim: true })).map(
+    (result) => ({
+      address: result.address,
+      family: result.family as 4 | 6,
+    }),
+  );
+}
+
+export async function resolveSafeDestination(
+  targetUrl: string,
+  lookupAddresses: DestinationLookup = lookupAllAddresses,
+): Promise<SafeDestinationResult> {
   let destination: URL;
   try {
     destination = new URL(targetUrl);
@@ -127,13 +151,18 @@ export async function resolveSafeDestination(targetUrl: string) {
     return { error: "Destination URL is invalid" as const };
   }
 
+  if (!["http:", "https:"].includes(destination.protocol)) {
+    return { error: "Destination URL must use http or https" as const };
+  }
+
   const hostname = destination.hostname.toLowerCase();
+  const lookupHostname = hostname.replace(/^\[|\]$/g, "");
   if (
     hostname === "localhost" ||
     hostname.endsWith(".localhost") ||
     hostname === "metadata.google.internal" ||
     hostname.endsWith(".internal") ||
-    isBlockedAddress(hostname)
+    isBlockedAddress(lookupHostname)
   ) {
     return {
       error: "Destination resolves to a private or internal address" as const,
@@ -141,18 +170,21 @@ export async function resolveSafeDestination(targetUrl: string) {
   }
 
   try {
-    const addresses = isIP(hostname)
-      ? [hostname]
-      : (await lookup(hostname, { all: true, verbatim: true })).map(
-          (result) => result.address,
-        );
-    if (!addresses.length || addresses.some(isBlockedAddress))
+    const addresses = isIP(lookupHostname)
+      ? [{ address: lookupHostname, family: isIP(lookupHostname) as 4 | 6 }]
+      : await lookupAddresses(lookupHostname);
+    if (!addresses.length || addresses.some(({ address }) => isBlockedAddress(address)))
       return {
         error: "Destination resolves to a private or internal address" as const,
       };
+
+    const selected = addresses[0];
+    return {
+      destination,
+      address: selected.address,
+      family: selected.family,
+    };
   } catch {
     return { error: "Destination hostname could not be resolved" as const };
   }
-
-  return { destination };
 }

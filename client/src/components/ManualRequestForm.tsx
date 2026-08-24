@@ -13,6 +13,7 @@ export type ManualRequestResult = {
   message: string;
   status?: number;
   statusText?: string;
+  redirected?: boolean;
   responseBody?: string;
   responseHeaders?: Record<string, string>;
   durationMs?: number;
@@ -124,7 +125,7 @@ export function ManualRequestForm({
           <div className="result-note">
             <Icon name={result.success ? "check" : "x"} className="h-4 w-4" />
             {result.success
-              ? `${result.status} ${result.statusText} · ${result.durationMs}ms`
+              ? `${result.status} ${result.statusText}${result.redirected ? " · redirect not followed" : ""} · ${result.durationMs}ms`
               : result.message}
           </div>
           {result.success && (

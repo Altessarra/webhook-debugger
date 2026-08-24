@@ -20,6 +20,7 @@ import {
 import { PaneResizeHandle } from "./components/PaneResizeHandle";
 import { RequestHistory } from "./components/RequestHistory";
 import { SchemaViewer } from "./components/SchemaViewer";
+import { SensitiveHeadersViewer } from "./components/SensitiveHeadersViewer";
 import { uiCopy } from "./data/content";
 import { Code } from "./pages/Code";
 import { Help } from "./pages/Help";
@@ -28,11 +29,19 @@ import type {
   CapturedRequest,
   ConnectionState,
   CopyTarget,
+  RequestHistoryResponse,
 } from "./types/webhook";
 import type { Theme } from "./types/theme";
 import { parseJsonValue } from "./utils/json";
+import {
+  invalidateHistoryLoading,
+  isCurrentHistoryRequest,
+  settleHistoryLoading,
+} from "./utils/historyRequestGuard";
 import { addInboxId, parseInboxIds } from "./utils/inboxSession";
 import { resizePaneWidth } from "./utils/paneResize";
+import { appendRequestPage } from "./utils/requestPagination";
+import { maskSensitiveHeaders } from "./utils/sensitiveHeaders";
 import { nextPayloadFormat, type PayloadFormat } from "./utils/uiState";
 
 const API_URL = "";
@@ -43,6 +52,7 @@ const DISPLAY_ORIGIN = window.location.origin;
 const INBOX_STORAGE_KEY = "webhook-debugger:inbox-id";
 const INBOX_IDS_STORAGE_KEY = "webhook-debugger:inbox-ids";
 const REQUEST_TIMEOUT_MS = 15000;
+const HISTORY_PAGE_SIZE = 50;
 
 type DetailTab = "overview" | "headers" | "query" | "raw";
 type PayloadTab = "payload" | "schema";
@@ -87,6 +97,30 @@ function formatBytes(value: string | null) {
   const bytes = new TextEncoder().encode(value).length;
   if (bytes < 1024) return `${bytes} B`;
   return `${(bytes / 1024).toFixed(2)} KB`;
+}
+
+function asStringRecord(value: unknown): Record<string, string> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+
+  const entries = Object.entries(value);
+  if (entries.some(([, item]) => typeof item !== "string")) {
+    return null;
+  }
+
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function getHeaderValue(
+  headers: Record<string, string> | null,
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const normalizedName = name.toLowerCase();
+  return Object.entries(headers).find(
+    ([headerName]) => headerName.toLowerCase() === normalizedName,
+  )?.[1];
 }
 
 function getInitialInboxIds() {
@@ -189,6 +223,10 @@ function App() {
   const [inboxes, setInboxes] = useState<string[]>(getInitialInboxIds);
   const [loading, setLoading] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [nextHistoryCursor, setNextHistoryCursor] = useState<string | null>(
+    null,
+  );
   const [requests, setRequests] = useState<CapturedRequest[]>([]);
   const [selected, setSelected] = useState<CapturedRequest | null>(null);
   const [connection, setConnection] = useState<ConnectionState>("disconnected");
@@ -199,12 +237,21 @@ function App() {
   const [payloadTab, setPayloadTab] = useState<PayloadTab>("payload");
   const [payloadFormat, setPayloadFormat] = useState<PayloadFormat>("pretty");
   const [paused, setPaused] = useState(false);
+  const [revealedSensitiveHeaders, setRevealedSensitiveHeaders] =
+    useState(false);
   const [initialPaneWidths] = useState(getInitialPaneWidths);
   const [paneWidths, setPaneWidths] = useState(initialPaneWidths);
   const workbenchRef = useRef<HTMLDivElement | null>(null);
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(false);
+  const activeInboxIdRef = useRef(inboxId);
+  const historyRequestGenerationRef = useRef(0);
+  const selectedRequestIdRef = useRef<string | null>(null);
+  const invalidateHistoryRequests = useCallback(() => {
+    historyRequestGenerationRef.current += 1;
+    invalidateHistoryLoading({ setHistoryLoading, setLoadingOlder });
+  }, []);
   const [replayUrl, setReplayUrl] = useState("");
   const [replaying, setReplaying] = useState(false);
   const [replayResult, setReplayResult] = useState<{
@@ -334,8 +381,12 @@ function App() {
     const handlePause = (event: Event) =>
       setPaused((event as CustomEvent<boolean>).detail);
     const handleClearHistory = () => {
+      invalidateHistoryRequests();
       setRequests([]);
+      setNextHistoryCursor(null);
+      selectedRequestIdRef.current = null;
       setSelected(null);
+      setRevealedSensitiveHeaders(false);
     };
     window.addEventListener("webhook-debugger:pause", handlePause);
     window.addEventListener(
@@ -349,7 +400,7 @@ function App() {
         handleClearHistory,
       );
     };
-  }, []);
+  }, [invalidateHistoryRequests]);
 
   useEffect(() => {
     const handleFormatClick = (event: Event) => {
@@ -412,8 +463,13 @@ function App() {
       if (!res.ok) throw new Error("Unable to create an inbox");
       const data = (await res.json()) as { id: string };
       if (!data.id) throw new Error("The server returned an invalid inbox");
+      activeInboxIdRef.current = data.id;
+      invalidateHistoryRequests();
       setRequests([]);
+      setNextHistoryCursor(null);
+      selectedRequestIdRef.current = null;
       setSelected(null);
+      setRevealedSensitiveHeaders(false);
       setInboxes((current) => addInboxId(current, data.id));
       window.dispatchEvent(
         new CustomEvent<string>("webhook-debugger:inbox-created", {
@@ -460,14 +516,27 @@ function App() {
 
   useEffect(() => {
     if (!inboxId) return;
+    const initiatingInboxId = inboxId;
+    const requestGeneration = historyRequestGenerationRef.current + 1;
+    historyRequestGenerationRef.current = requestGeneration;
     let cancelled = false;
+    const isCurrentRequest = () =>
+      !cancelled &&
+      isCurrentHistoryRequest({
+        activeInboxId: activeInboxIdRef.current,
+        initiatingInboxId,
+        activeGeneration: historyRequestGenerationRef.current,
+        requestGeneration,
+      });
     Promise.resolve()
       .then(() => {
-        if (!cancelled) {
+        if (isCurrentRequest()) {
           setHistoryLoading(true);
           setError(null);
         }
-        return fetch(`${API_URL}/api/inboxes/${inboxId}/requests`);
+        return fetch(
+          `${API_URL}/api/inboxes/${initiatingInboxId}/requests?limit=${HISTORY_PAGE_SIZE}`,
+        );
       })
       .then(async (res) => {
         if (!res.ok)
@@ -476,36 +545,95 @@ function App() {
               ? "This inbox no longer exists"
               : "Unable to load request history",
           );
-        return (await res.json()) as { requests: CapturedRequest[] };
+        return (await res.json()) as RequestHistoryResponse;
       })
       .then((data) => {
-        if (!cancelled)
-          setRequests(
-            data.requests.map((request) => ({
-              ...request,
-              createdAt: getRequestTime(request),
-            })),
-          );
+        if (!isCurrentRequest()) return;
+        setRequests(
+          data.requests.map((request) => ({
+            ...request,
+            createdAt: getRequestTime(request),
+          })),
+        );
+        setNextHistoryCursor(data.nextCursor);
       })
       .catch((err: unknown) => {
-        if (!cancelled) {
+        if (isCurrentRequest()) {
           const message =
             err instanceof Error
               ? err.message
               : "Unable to load request history";
           if (message !== "This inbox no longer exists") setError(message);
-          setInboxes((current) => current.filter((id) => id !== inboxId));
+          setInboxes((current) =>
+            current.filter((id) => id !== initiatingInboxId),
+          );
+          activeInboxIdRef.current = null;
+          invalidateHistoryRequests();
+          selectedRequestIdRef.current = null;
           setInboxId(null);
           navigate("/");
         }
       })
       .finally(() => {
-        if (!cancelled) setHistoryLoading(false);
+        settleHistoryLoading("initial", isCurrentRequest(), {
+          setHistoryLoading,
+          setLoadingOlder,
+        });
       });
     return () => {
+      settleHistoryLoading("initial", isCurrentRequest(), {
+        setHistoryLoading,
+        setLoadingOlder,
+      });
       cancelled = true;
     };
-  }, [inboxId, navigate]);
+  }, [inboxId, invalidateHistoryRequests, navigate]);
+
+  const loadOlderRequests = async () => {
+    if (!inboxId || !nextHistoryCursor || loadingOlder) return;
+    const initiatingInboxId = inboxId;
+    const cursor = nextHistoryCursor;
+    const requestGeneration = historyRequestGenerationRef.current + 1;
+    historyRequestGenerationRef.current = requestGeneration;
+    const isCurrentRequest = () =>
+      isCurrentHistoryRequest({
+        activeInboxId: activeInboxIdRef.current,
+        initiatingInboxId,
+        activeGeneration: historyRequestGenerationRef.current,
+        requestGeneration,
+      });
+
+    setLoadingOlder(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `${API_URL}/api/inboxes/${initiatingInboxId}/requests?limit=${HISTORY_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`,
+      );
+      if (!response.ok) throw new Error("Unable to load older requests");
+
+      const page = (await response.json()) as RequestHistoryResponse;
+      const normalizedPage = {
+        ...page,
+        requests: page.requests.map((request) => ({
+          ...request,
+          createdAt: getRequestTime(request),
+        })),
+      };
+      if (!isCurrentRequest()) return;
+      setRequests((current) => appendRequestPage(current, normalizedPage).requests);
+      setNextHistoryCursor(normalizedPage.nextCursor);
+    } catch (err) {
+      if (!isCurrentRequest()) return;
+      setError(
+        err instanceof Error ? err.message : "Unable to load older requests",
+      );
+    } finally {
+      settleHistoryLoading("older", isCurrentRequest(), {
+        setHistoryLoading,
+        setLoadingOlder,
+      });
+    }
+  };
 
   useEffect(() => {
     if (!inboxId) return;
@@ -528,7 +656,11 @@ function App() {
         request,
         ...prev.filter((item) => item.id !== request.id),
       ]);
-      setSelected((current) => current ?? request);
+      if (selectedRequestIdRef.current === null) {
+        selectedRequestIdRef.current = request.id;
+        setSelected(request);
+        setRevealedSensitiveHeaders(false);
+      }
       setFreshRequestId(request.id);
       window.setTimeout(() => setFreshRequestId(null), 350);
     };
@@ -541,9 +673,11 @@ function App() {
   }, [inboxId]);
 
   const selectRequest = (request: CapturedRequest) => {
+    selectedRequestIdRef.current = request.id;
     setSelected(request);
     setDetailTab("overview");
     setPayloadTab("payload");
+    setRevealedSensitiveHeaders(false);
     setReplayResult(null);
     setVerifyResult(null);
     setStripeSecret("");
@@ -553,13 +687,18 @@ function App() {
   const selectInbox = useCallback(
     (nextInboxId: string) => {
       if (nextInboxId === inboxId) return;
+      activeInboxIdRef.current = nextInboxId;
+      invalidateHistoryRequests();
       setRequests([]);
+      setNextHistoryCursor(null);
+      selectedRequestIdRef.current = null;
       setSelected(null);
+      setRevealedSensitiveHeaders(false);
       setError(null);
       setInboxId(nextInboxId);
       navigate("/requests");
     },
-    [inboxId, navigate],
+    [inboxId, invalidateHistoryRequests, navigate],
   );
 
   useEffect(() => {
@@ -581,19 +720,24 @@ function App() {
       const res = await fetch(`${API_URL}/api/replay`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ requestId: selected.id, targetUrl: replayUrl }),
+        body: JSON.stringify({
+          inboxId,
+          requestId: selected.id,
+          targetUrl: replayUrl,
+        }),
       });
       const data = (await res.json()) as {
         success?: boolean;
         status?: number;
         statusText?: string;
+        redirected?: boolean;
         error?: string;
       };
       if (!res.ok || !data.success)
         throw new Error(data.error ?? "Replay failed");
       setReplayResult({
         success: true,
-        message: `${data.status} ${data.statusText}`,
+        message: `${data.status} ${data.statusText}${data.redirected ? " · redirect not followed" : ""}`,
       });
     } catch (err) {
       setReplayResult({
@@ -614,7 +758,10 @@ function App() {
         string,
         string
       > | null;
-      const signatureHeader = headers?.["stripe-signature"];
+      const signatureHeader = getHeaderValue(
+        asStringRecord(headers),
+        "stripe-signature",
+      );
       if (!signatureHeader) {
         setVerifyResult({
           valid: false,
@@ -654,6 +801,7 @@ function App() {
         success?: boolean;
         status?: number;
         statusText?: string;
+        redirected?: boolean;
         error?: string;
         responseBody?: string;
         responseHeaders?: Record<string, string>;
@@ -666,6 +814,7 @@ function App() {
         message: `${data.status} ${data.statusText}`,
         status: data.status,
         statusText: data.statusText,
+        redirected: data.redirected,
         responseBody: data.responseBody,
         responseHeaders: data.responseHeaders,
         durationMs: data.durationMs,
@@ -772,13 +921,23 @@ function App() {
   if (location.pathname === "/") return <Navigate to="/requests" replace />;
 
   const selectedHeaders = selected
-    ? (parseJsonValue(selected.headers) as Record<string, string> | null)
+    ? asStringRecord(parseJsonValue(selected.headers))
     : null;
+  const displayedHeaders = selected
+    ? asStringRecord(
+        parseJsonValue(
+          maskSensitiveHeaders(selected.headers, revealedSensitiveHeaders),
+        ),
+      )
+    : null;
+  const displayedHeaderText = selected
+    ? maskSensitiveHeaders(selected.headers, revealedSensitiveHeaders)
+    : "";
   const query = selected
     ? (parseJsonValue(selected.query) as Record<string, string> | null)
     : null;
-  const hasStripeSignature = !!selectedHeaders?.["stripe-signature"];
-  const headerEntries = selectedHeaders ? Object.entries(selectedHeaders) : [];
+  const hasStripeSignature = !!getHeaderValue(selectedHeaders, "stripe-signature");
+  const headerEntries = displayedHeaders ? Object.entries(displayedHeaders) : [];
 
   const renderOverview = () => (
     <>
@@ -795,18 +954,18 @@ function App() {
           <div>
             <span>Source IP</span>
             <code>
-              {selectedHeaders?.["x-forwarded-for"] ??
-                selectedHeaders?.["x-real-ip"] ??
+              {getHeaderValue(displayedHeaders, "x-forwarded-for") ??
+                getHeaderValue(displayedHeaders, "x-real-ip") ??
                 "—"}
             </code>
           </div>
           <div>
             <span>User Agent</span>
-            <code>{selectedHeaders?.["user-agent"] ?? "—"}</code>
+            <code>{getHeaderValue(displayedHeaders, "user-agent") ?? "—"}</code>
           </div>
           <div>
             <span>Content Type</span>
-            <code>{selectedHeaders?.["content-type"] ?? "—"}</code>
+            <code>{getHeaderValue(displayedHeaders, "content-type") ?? "—"}</code>
           </div>
           <div>
             <span>Content Length</span>
@@ -876,7 +1035,13 @@ function App() {
     if (detailTab === "headers")
       return (
         <MetaSection title="All headers">
-          <JsonViewer value={selected?.headers} />
+          <SensitiveHeadersViewer
+            headers={selected?.headers}
+            revealed={revealedSensitiveHeaders}
+            onToggleReveal={() =>
+              setRevealedSensitiveHeaders((current) => !current)
+            }
+          />
         </MetaSection>
       );
     if (detailTab === "query")
@@ -893,7 +1058,7 @@ function App() {
         <MetaSection title="Raw request">
           <pre className="raw-request">
             {selected?.method} {selected?.path}\n
-            {selectedHeaders ? JSON.stringify(selectedHeaders, null, 2) : ""}
+            {displayedHeaderText}
             \n\n{selected?.body ?? ""}
           </pre>
         </MetaSection>
@@ -918,6 +1083,9 @@ function App() {
           inboxId={inboxId}
           webhookUrl={webhookUrl}
           connection={connection}
+          hasOlder={nextHistoryCursor !== null}
+          loadingOlder={loadingOlder}
+          onLoadOlder={() => void loadOlderRequests()}
           copied={copyTarget === "url"}
           onCopyUrl={() => copyText(webhookUrl, "url")}
         />

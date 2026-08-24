@@ -39,6 +39,9 @@ export function RequestHistory({
   onSelectInbox,
   webhookUrl,
   connection,
+  hasOlder,
+  loadingOlder,
+  onLoadOlder,
   copied,
   onCopyUrl,
   onNewInbox,
@@ -53,6 +56,9 @@ export function RequestHistory({
   onSelectInbox?: (id: string) => void;
   webhookUrl: string;
   connection: ConnectionState;
+  hasOlder: boolean;
+  loadingOlder: boolean;
+  onLoadOlder: () => void;
   copied: boolean;
   onCopyUrl: () => void;
   onNewInbox?: () => void;
@@ -259,6 +265,16 @@ export function RequestHistory({
           ))
         )}
       </div>
+      {hasOlder && (
+        <button
+          type="button"
+          className="secondary-button compact-button"
+          onClick={onLoadOlder}
+          disabled={loadingOlder}
+        >
+          {loadingOlder ? "Loading older…" : "Load older"}
+        </button>
+      )}
       <div className="inbox-footer">
         <span>
           <span className="live-select-dot" />

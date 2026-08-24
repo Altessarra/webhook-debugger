@@ -1,0 +1,339 @@
+import assert from "node:assert/strict";
+import http from "node:http";
+import { afterEach, test } from "node:test";
+import { WebSocket, type ClientOptions } from "ws";
+
+import { createInbox } from "./db";
+import { attachWebSocketServer, fastify, startServer } from "./index";
+
+const ownedServers: Array<http.Server> = [];
+const ownedSockets: WebSocket[] = [];
+const cleanups: Array<() => void> = [];
+const timerRestores: Array<() => void> = [];
+
+afterEach(async () => {
+  for (const socket of ownedSockets.splice(0)) {
+    if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+      socket.terminate();
+    }
+  }
+  for (const cleanup of cleanups.splice(0)) cleanup();
+  for (const restore of timerRestores.splice(0)) restore();
+  await Promise.all(
+    ownedServers.splice(0).map(
+      (server) => new Promise<void>((resolve) => server.close(() => resolve())),
+    ),
+  );
+});
+
+function createInboxId() {
+  const id = `ws-${Math.random().toString(36).slice(2)}`;
+  createInbox(id);
+  return id;
+}
+
+async function createTestServerWithControl() {
+  const server = http.createServer();
+  ownedServers.push(server);
+  cleanups.push(attachWebSocketServer(server));
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  return { endpoint: `ws://127.0.0.1:${address.port}`, server };
+}
+
+async function createTestServer() {
+  return (await createTestServerWithControl()).endpoint;
+}
+
+type TestClientOptions = ClientOptions & { autoPong?: boolean };
+
+function connect(url: string, options: TestClientOptions = {}) {
+  const socket = new WebSocket(url, options);
+  ownedSockets.push(socket);
+  return socket;
+}
+
+function opens(socket: WebSocket) {
+  return new Promise<void>((resolve, reject) => {
+    socket.once("open", resolve);
+    socket.once("error", reject);
+  });
+}
+
+function closes(socket: WebSocket) {
+  return new Promise<{ code: number }>((resolve) => {
+    socket.once("close", (code) => resolve({ code }));
+  });
+}
+
+function rejectsUpgrade(socket: WebSocket) {
+  return new Promise<number>((resolve) => {
+    socket.once("unexpected-response", (_request, response) => {
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    socket.once("error", () => resolve(0));
+  });
+}
+
+function rejectedUpgradeResponse(socket: WebSocket) {
+  return new Promise<{ statusCode: number; headers: http.IncomingHttpHeaders }>(
+    (resolve, reject) => {
+      socket.once("unexpected-response", (_request, response) => {
+        response.resume();
+        resolve({ statusCode: response.statusCode ?? 0, headers: response.headers });
+      });
+      socket.once("error", reject);
+    },
+  );
+}
+
+function upgradeOutcome(socket: WebSocket) {
+  return new Promise<number | "open">((resolve) => {
+    socket.once("unexpected-response", (_request, response) => {
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    socket.once("open", () => resolve("open"));
+    socket.once("error", () => resolve(0));
+  });
+}
+
+function controlHeartbeat() {
+  const originalSetInterval = globalThis.setInterval;
+  const originalNow = Date.now;
+  const callbacks: Array<() => void> = [];
+  let now = 0;
+
+  globalThis.setInterval = ((callback: () => void) => {
+    callbacks.push(callback);
+    const timer = originalSetInterval(() => undefined, 2_147_483_647);
+    timer.unref();
+    return timer;
+  }) as typeof setInterval;
+  Date.now = () => now;
+
+  return {
+    advance: () => {
+      now += 30_000;
+      for (const callback of callbacks) callback();
+    },
+    restore: () => {
+      globalThis.setInterval = originalSetInterval;
+      Date.now = originalNow;
+    },
+  };
+}
+
+test("rejects upgrade paths other than the inbox subscription root", async () => {
+  const endpoint = await createTestServer();
+  const socket = connect(`${endpoint}/not-a-subscription?inboxId=${createInboxId()}`);
+
+  assert.equal(await rejectsUpgrade(socket), 404);
+});
+
+test("rejects browser upgrades from an origin other than the configured application origin", async () => {
+  const endpoint = await createTestServer();
+  const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`, {
+    headers: { origin: "https://untrusted.example" },
+  });
+
+  const response = await rejectedUpgradeResponse(socket);
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.headers["x-content-type-options"], "nosniff");
+  assert.equal(
+    response.headers["content-security-policy"],
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  );
+});
+
+test("rejects subscriptions for inboxes that do not exist", async () => {
+  const endpoint = await createTestServer();
+  const socket = connect(`${endpoint}/?inboxId=missing-inbox`);
+
+  assert.equal(await rejectsUpgrade(socket), 404);
+});
+
+test("rejects the eleventh concurrent subscription from one IP and releases the slot on close", async () => {
+  const endpoint = await createTestServer();
+  const inboxId = createInboxId();
+  const sockets = await Promise.all(
+    Array.from({ length: 10 }, async () => {
+      const socket = connect(`${endpoint}/?inboxId=${inboxId}`);
+      await opens(socket);
+      return socket;
+    }),
+  );
+  const overLimit = connect(`${endpoint}/?inboxId=${inboxId}`);
+  assert.equal(await rejectsUpgrade(overLimit), 429);
+
+  const closed = closes(sockets[0]!);
+  sockets[0]!.close();
+  await closed;
+
+  const replacement = connect(`${endpoint}/?inboxId=${inboxId}`);
+  await opens(replacement);
+});
+
+test("keeps existing IP reservations when an upgrade handler throws", async () => {
+  const { endpoint, server } = await createTestServerWithControl();
+  const inboxId = createInboxId();
+  let capturedRequest: http.IncomingMessage | undefined;
+  let capturedSocket: import("node:stream").Duplex | undefined;
+  let capturedHead: Buffer | undefined;
+  server.once("upgrade", (request, socket, head) => {
+    capturedRequest = request;
+    capturedSocket = socket;
+    capturedHead = head;
+  });
+
+  const existing = connect(`${endpoint}/?inboxId=${inboxId}`);
+  await opens(existing);
+  assert.ok(capturedRequest && capturedSocket && capturedHead);
+
+  const originalWrite = capturedSocket.write;
+  const originalDestroy = capturedSocket.destroy;
+  capturedSocket.write = (() => true) as typeof capturedSocket.write;
+  capturedSocket.destroy = (() => capturedSocket) as typeof capturedSocket.destroy;
+  try {
+    server.emit("upgrade", capturedRequest, capturedSocket, capturedHead);
+  } finally {
+    capturedSocket.write = originalWrite;
+    capturedSocket.destroy = originalDestroy;
+  }
+
+  for (let index = 0; index < 9; index += 1) {
+    await opens(connect(`${endpoint}/?inboxId=${inboxId}`));
+  }
+  const overLimit = connect(`${endpoint}/?inboxId=${inboxId}`);
+  assert.equal(await upgradeOutcome(overLimit), 429);
+});
+
+test("enforces the configured payload cap before registering client data", async () => {
+  const endpoint = await createTestServer();
+  const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`);
+  await opens(socket);
+  const closed = closes(socket);
+
+  socket.send("x".repeat(65_537));
+
+  assert.equal((await closed).code, 1009);
+});
+
+test("closes client messages because subscriptions are server-push only", async () => {
+  const endpoint = await createTestServer();
+  const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`);
+  await opens(socket);
+  const closed = closes(socket);
+
+  socket.send("subscribe");
+
+  assert.equal((await closed).code, 1008);
+});
+
+test("keeps a subscription alive when it answers every later heartbeat", async () => {
+  const heartbeat = controlHeartbeat();
+  timerRestores.push(heartbeat.restore);
+  const endpoint = await createTestServer();
+  const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`, { autoPong: false });
+  socket.on("ping", () => socket.pong());
+  await opens(socket);
+
+  const ping = new Promise<void>((resolve) => socket.once("ping", () => resolve()));
+  heartbeat.advance();
+  await ping;
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  const laterPing = new Promise<void>((resolve) => socket.once("ping", () => resolve()));
+  heartbeat.advance();
+  await laterPing;
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  heartbeat.advance();
+  assert.equal(socket.readyState, WebSocket.OPEN);
+});
+
+test("terminates a subscription at the next heartbeat after it misses a pong", async () => {
+  const heartbeat = controlHeartbeat();
+  timerRestores.push(heartbeat.restore);
+  const endpoint = await createTestServer();
+  const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`, { autoPong: false });
+  await opens(socket);
+  const closed = closes(socket);
+
+  heartbeat.advance();
+  heartbeat.advance();
+
+  const close = await Promise.race([
+    closed,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 100)),
+  ]);
+  assert.deepEqual(close, { code: 1006 });
+});
+
+test("removes an empty subscriber set when the final socket closes", async () => {
+  const endpoint = await createTestServer();
+  const inboxId = createInboxId();
+  const socket = connect(`${endpoint}/?inboxId=${inboxId}`);
+  await opens(socket);
+  const closed = closes(socket);
+  socket.close();
+  await closed;
+
+  const replacement = connect(`${endpoint}/?inboxId=${inboxId}`);
+  await opens(replacement);
+});
+
+test("production bootstrap registers shutdown hooks before listening", async () => {
+  const originalListen = fastify.listen;
+  const originalLog = console.log;
+  const originalExit = process.exit;
+  const originalError = fastify.log.error;
+  const listenOnEphemeralPort = originalListen as unknown as (options: {
+    port: number;
+    host: string;
+  }) => Promise<string>;
+  const loggedErrors: unknown[] = [];
+  let exitCode: number | undefined;
+
+  fastify.listen = (async function listenWithEphemeralPort() {
+    return listenOnEphemeralPort.call(fastify, { port: 0, host: "127.0.0.1" });
+  }) as unknown as typeof fastify.listen;
+  console.log = () => undefined;
+  process.exit = ((code?: number) => {
+    exitCode = code;
+    throw new Error("__startServer_exit__");
+  }) as typeof process.exit;
+  fastify.log.error = ((error: unknown) => {
+    loggedErrors.push(error);
+    return fastify.log;
+  }) as typeof fastify.log.error;
+
+  try {
+    await startServer();
+    assert.equal(exitCode, undefined);
+    assert.deepEqual(loggedErrors, []);
+    assert.equal(fastify.server.listening, true);
+    assert.equal(fastify.server.listenerCount("upgrade"), 1);
+
+    await fastify.close();
+
+    assert.equal(fastify.server.listenerCount("upgrade"), 0);
+  } catch (error) {
+    if (error instanceof Error && error.message === "__startServer_exit__") {
+      const startupError = loggedErrors[0] as { code?: string } | undefined;
+      assert.fail(
+        `startServer exited with ${exitCode ?? "undefined"} after ${startupError?.code ?? "unknown startup error"}`,
+      );
+    }
+    throw error;
+  } finally {
+    fastify.listen = originalListen;
+    console.log = originalLog;
+    process.exit = originalExit;
+    fastify.log.error = originalError;
+    fastify.server.removeAllListeners("upgrade");
+    if (fastify.server.listening) {
+      await fastify.close();
+    }
+  }
+});

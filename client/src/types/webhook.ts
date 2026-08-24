@@ -11,5 +11,10 @@ export type CapturedRequest = {
   created_at?: number;
 };
 
+export type RequestHistoryResponse = {
+  requests: CapturedRequest[];
+  nextCursor: string | null;
+};
+
 export type ConnectionState = "connecting" | "connected" | "disconnected";
 export type CopyTarget = "url" | "curl" | "generic" | null;
