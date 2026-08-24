@@ -113,28 +113,14 @@ type RequestPage = {
   nextCursor: string | null;
 };
 
-export function getRequestsForInbox(inboxId: string): CapturedRow[];
 export function getRequestsForInbox(
   inboxId: string,
   options: { limit: number; cursor?: RequestCursor },
 ): RequestPage;
 export function getRequestsForInbox(
   inboxId: string,
-  options?: { limit: number; cursor?: RequestCursor },
+  options: { limit: number; cursor?: RequestCursor },
 ) {
-  if (!options) {
-    return db
-      .prepare(
-        `
-          SELECT *
-          FROM requests
-          WHERE inbox_id = ?
-          ORDER BY created_at DESC, id DESC
-        `,
-      )
-      .all(inboxId) as CapturedRow[];
-  }
-
   const limit = Math.max(1, Math.min(MAX_HISTORY_PAGE_SIZE, options.limit));
   const limitPlusOne = limit + 1;
   let rows: CapturedRow[];

@@ -77,6 +77,18 @@ function rejectsUpgrade(socket: WebSocket) {
   });
 }
 
+function rejectedUpgradeResponse(socket: WebSocket) {
+  return new Promise<{ statusCode: number; headers: http.IncomingHttpHeaders }>(
+    (resolve, reject) => {
+      socket.once("unexpected-response", (_request, response) => {
+        response.resume();
+        resolve({ statusCode: response.statusCode ?? 0, headers: response.headers });
+      });
+      socket.once("error", reject);
+    },
+  );
+}
+
 function upgradeOutcome(socket: WebSocket) {
   return new Promise<number | "open">((resolve) => {
     socket.once("unexpected-response", (_request, response) => {
@@ -127,7 +139,13 @@ test("rejects browser upgrades from an origin other than the configured applicat
     headers: { origin: "https://untrusted.example" },
   });
 
-  assert.equal(await rejectsUpgrade(socket), 403);
+  const response = await rejectedUpgradeResponse(socket);
+  assert.equal(response.statusCode, 403);
+  assert.equal(response.headers["x-content-type-options"], "nosniff");
+  assert.equal(
+    response.headers["content-security-policy"],
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+  );
 });
 
 test("rejects subscriptions for inboxes that do not exist", async () => {
@@ -214,26 +232,27 @@ test("closes client messages because subscriptions are server-push only", async 
   assert.equal((await closed).code, 1008);
 });
 
-test("refreshes liveness after a pong across a later heartbeat cutoff", async () => {
+test("keeps a subscription alive when it answers every later heartbeat", async () => {
   const heartbeat = controlHeartbeat();
   timerRestores.push(heartbeat.restore);
   const endpoint = await createTestServer();
-  const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`);
+  const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`, { autoPong: false });
+  socket.on("ping", () => socket.pong());
   await opens(socket);
 
   const ping = new Promise<void>((resolve) => socket.once("ping", () => resolve()));
   heartbeat.advance();
   await ping;
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
   const laterPing = new Promise<void>((resolve) => socket.once("ping", () => resolve()));
   heartbeat.advance();
   await laterPing;
-  await new Promise<void>((resolve) => setImmediate(resolve));
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
   heartbeat.advance();
   assert.equal(socket.readyState, WebSocket.OPEN);
 });
 
-test("terminates an idle subscription that does not answer a heartbeat", async () => {
+test("terminates a subscription at the next heartbeat after it misses a pong", async () => {
   const heartbeat = controlHeartbeat();
   timerRestores.push(heartbeat.restore);
   const endpoint = await createTestServer();
@@ -243,9 +262,12 @@ test("terminates an idle subscription that does not answer a heartbeat", async (
 
   heartbeat.advance();
   heartbeat.advance();
-  heartbeat.advance();
 
-  assert.equal((await closed).code, 1006);
+  const close = await Promise.race([
+    closed,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 100)),
+  ]);
+  assert.deepEqual(close, { code: 1006 });
 });
 
 test("removes an empty subscriber set when the final socket closes", async () => {

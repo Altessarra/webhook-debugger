@@ -155,15 +155,21 @@ export function attachWebSocketServer(httpServer: HttpServer) {
   const heartbeat = setInterval(() => {
     const now = Date.now();
     for (const socket of sockets) {
-      const lastPongAt = (socket as WebSocket & { lastPongAt?: number }).lastPongAt;
+      const heartbeatSocket = socket as WebSocket & {
+        lastPongAt?: number;
+        isAlive?: boolean;
+      };
+      const { lastPongAt } = heartbeatSocket;
       if (
         socket.readyState !== WebSocket.OPEN ||
         lastPongAt === undefined ||
-        now - lastPongAt >= wsIdleTimeoutMs
+        now - lastPongAt >= wsIdleTimeoutMs ||
+        !heartbeatSocket.isAlive
       ) {
         socket.terminate();
         continue;
       }
+      heartbeatSocket.isAlive = false;
       socket.ping();
     }
   }, wsHeartbeatIntervalMs);
@@ -213,7 +219,12 @@ export function attachWebSocketServer(httpServer: HttpServer) {
         const subscribers = inboxSubscribers.get(inboxId) ?? new Set<WebSocket>();
         inboxSubscribers.set(inboxId, subscribers);
         subscribers.add(webSocket);
-        (webSocket as WebSocket & { lastPongAt?: number }).lastPongAt = Date.now();
+        const heartbeatSocket = webSocket as WebSocket & {
+          lastPongAt?: number;
+          isAlive?: boolean;
+        };
+        heartbeatSocket.lastPongAt = Date.now();
+        heartbeatSocket.isAlive = true;
 
         let cleaned = false;
         const cleanup = () => {
@@ -229,7 +240,8 @@ export function attachWebSocketServer(httpServer: HttpServer) {
 
         socketCleanups.set(webSocket, cleanup);
         webSocket.on("pong", () => {
-          (webSocket as WebSocket & { lastPongAt?: number }).lastPongAt = Date.now();
+          heartbeatSocket.lastPongAt = Date.now();
+          heartbeatSocket.isAlive = true;
         });
         webSocket.on("message", () => webSocket.close(1008, "Server-push only"));
         webSocket.on("close", cleanup);

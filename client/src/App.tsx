@@ -33,6 +33,7 @@ import type {
 } from "./types/webhook";
 import type { Theme } from "./types/theme";
 import { parseJsonValue } from "./utils/json";
+import { isCurrentHistoryRequest } from "./utils/historyRequestGuard";
 import { addInboxId, parseInboxIds } from "./utils/inboxSession";
 import { resizePaneWidth } from "./utils/paneResize";
 import { appendRequestPage } from "./utils/requestPagination";
@@ -240,6 +241,9 @@ function App() {
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(false);
+  const activeInboxIdRef = useRef(inboxId);
+  const historyRequestGenerationRef = useRef(0);
+  const selectedRequestIdRef = useRef<string | null>(null);
   const [replayUrl, setReplayUrl] = useState("");
   const [replaying, setReplaying] = useState(false);
   const [replayResult, setReplayResult] = useState<{
@@ -369,8 +373,10 @@ function App() {
     const handlePause = (event: Event) =>
       setPaused((event as CustomEvent<boolean>).detail);
     const handleClearHistory = () => {
+      historyRequestGenerationRef.current += 1;
       setRequests([]);
       setNextHistoryCursor(null);
+      selectedRequestIdRef.current = null;
       setSelected(null);
       setRevealedSensitiveHeaders(false);
     };
@@ -449,9 +455,13 @@ function App() {
       if (!res.ok) throw new Error("Unable to create an inbox");
       const data = (await res.json()) as { id: string };
       if (!data.id) throw new Error("The server returned an invalid inbox");
+      activeInboxIdRef.current = data.id;
+      historyRequestGenerationRef.current += 1;
       setRequests([]);
       setNextHistoryCursor(null);
+      selectedRequestIdRef.current = null;
       setSelected(null);
+      setRevealedSensitiveHeaders(false);
       setInboxes((current) => addInboxId(current, data.id));
       window.dispatchEvent(
         new CustomEvent<string>("webhook-debugger:inbox-created", {
@@ -498,15 +508,26 @@ function App() {
 
   useEffect(() => {
     if (!inboxId) return;
+    const initiatingInboxId = inboxId;
+    const requestGeneration = historyRequestGenerationRef.current + 1;
+    historyRequestGenerationRef.current = requestGeneration;
     let cancelled = false;
+    const isCurrentRequest = () =>
+      !cancelled &&
+      isCurrentHistoryRequest({
+        activeInboxId: activeInboxIdRef.current,
+        initiatingInboxId,
+        activeGeneration: historyRequestGenerationRef.current,
+        requestGeneration,
+      });
     Promise.resolve()
       .then(() => {
-        if (!cancelled) {
+        if (isCurrentRequest()) {
           setHistoryLoading(true);
           setError(null);
         }
         return fetch(
-          `${API_URL}/api/inboxes/${inboxId}/requests?limit=${HISTORY_PAGE_SIZE}`,
+          `${API_URL}/api/inboxes/${initiatingInboxId}/requests?limit=${HISTORY_PAGE_SIZE}`,
         );
       })
       .then(async (res) => {
@@ -519,29 +540,34 @@ function App() {
         return (await res.json()) as RequestHistoryResponse;
       })
       .then((data) => {
-        if (!cancelled)
-          setRequests(
-            data.requests.map((request) => ({
-              ...request,
-              createdAt: getRequestTime(request),
-            })),
-          );
-          setNextHistoryCursor(data.nextCursor);
+        if (!isCurrentRequest()) return;
+        setRequests(
+          data.requests.map((request) => ({
+            ...request,
+            createdAt: getRequestTime(request),
+          })),
+        );
+        setNextHistoryCursor(data.nextCursor);
       })
       .catch((err: unknown) => {
-        if (!cancelled) {
+        if (isCurrentRequest()) {
           const message =
             err instanceof Error
               ? err.message
               : "Unable to load request history";
           if (message !== "This inbox no longer exists") setError(message);
-          setInboxes((current) => current.filter((id) => id !== inboxId));
+          setInboxes((current) =>
+            current.filter((id) => id !== initiatingInboxId),
+          );
+          activeInboxIdRef.current = null;
+          historyRequestGenerationRef.current += 1;
+          selectedRequestIdRef.current = null;
           setInboxId(null);
           navigate("/");
         }
       })
       .finally(() => {
-        if (!cancelled) setHistoryLoading(false);
+        if (isCurrentRequest()) setHistoryLoading(false);
       });
     return () => {
       cancelled = true;
@@ -550,12 +576,23 @@ function App() {
 
   const loadOlderRequests = async () => {
     if (!inboxId || !nextHistoryCursor || loadingOlder) return;
+    const initiatingInboxId = inboxId;
+    const cursor = nextHistoryCursor;
+    const requestGeneration = historyRequestGenerationRef.current + 1;
+    historyRequestGenerationRef.current = requestGeneration;
+    const isCurrentRequest = () =>
+      isCurrentHistoryRequest({
+        activeInboxId: activeInboxIdRef.current,
+        initiatingInboxId,
+        activeGeneration: historyRequestGenerationRef.current,
+        requestGeneration,
+      });
 
     setLoadingOlder(true);
     setError(null);
     try {
       const response = await fetch(
-        `${API_URL}/api/inboxes/${inboxId}/requests?limit=${HISTORY_PAGE_SIZE}&cursor=${encodeURIComponent(nextHistoryCursor)}`,
+        `${API_URL}/api/inboxes/${initiatingInboxId}/requests?limit=${HISTORY_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`,
       );
       if (!response.ok) throw new Error("Unable to load older requests");
 
@@ -567,14 +604,16 @@ function App() {
           createdAt: getRequestTime(request),
         })),
       };
+      if (!isCurrentRequest()) return;
       setRequests((current) => appendRequestPage(current, normalizedPage).requests);
       setNextHistoryCursor(normalizedPage.nextCursor);
     } catch (err) {
+      if (!isCurrentRequest()) return;
       setError(
         err instanceof Error ? err.message : "Unable to load older requests",
       );
     } finally {
-      setLoadingOlder(false);
+      if (isCurrentRequest()) setLoadingOlder(false);
     }
   };
 
@@ -599,7 +638,11 @@ function App() {
         request,
         ...prev.filter((item) => item.id !== request.id),
       ]);
-      setSelected((current) => current ?? request);
+      if (selectedRequestIdRef.current === null) {
+        selectedRequestIdRef.current = request.id;
+        setSelected(request);
+        setRevealedSensitiveHeaders(false);
+      }
       setFreshRequestId(request.id);
       window.setTimeout(() => setFreshRequestId(null), 350);
     };
@@ -612,6 +655,7 @@ function App() {
   }, [inboxId]);
 
   const selectRequest = (request: CapturedRequest) => {
+    selectedRequestIdRef.current = request.id;
     setSelected(request);
     setDetailTab("overview");
     setPayloadTab("payload");
@@ -625,8 +669,11 @@ function App() {
   const selectInbox = useCallback(
     (nextInboxId: string) => {
       if (nextInboxId === inboxId) return;
+      activeInboxIdRef.current = nextInboxId;
+      historyRequestGenerationRef.current += 1;
       setRequests([]);
       setNextHistoryCursor(null);
+      selectedRequestIdRef.current = null;
       setSelected(null);
       setRevealedSensitiveHeaders(false);
       setError(null);
