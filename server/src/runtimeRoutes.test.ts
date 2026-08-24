@@ -62,6 +62,18 @@ test("limits inbox history reads and returns malformed cursors as stable client 
   assert.equal(malformed.statusCode, 400);
   assert.deepEqual(malformed.json(), { error: "Invalid request cursor" });
 
+  const emptyCursorApp = createTestApp();
+  const emptyCursorInbox = (await emptyCursorApp.inject({
+    method: "POST",
+    url: "/api/inboxes",
+  })).json() as { id: string };
+  const emptyCursor = await emptyCursorApp.inject({
+    method: "GET",
+    url: `/api/inboxes/${emptyCursorInbox.id}/requests?cursor=`,
+  });
+  assert.equal(emptyCursor.statusCode, 400);
+  assert.deepEqual(emptyCursor.json(), { error: "Invalid request cursor" });
+
   const app = createTestApp();
   const inbox = (await app.inject({ method: "POST", url: "/api/inboxes" })).json() as { id: string };
   assert.equal(

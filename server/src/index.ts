@@ -189,7 +189,7 @@ export function buildServer(options: BuildServerOptions = {}) {
     try {
       return getRequestsForInbox(id, {
         limit: getHistoryPageLimit(limit),
-        ...(cursor ? { cursor: decodeRequestCursor(cursor) } : {}),
+        ...(cursor !== undefined ? { cursor: decodeRequestCursor(cursor) } : {}),
       });
     } catch {
       reply.code(400);
