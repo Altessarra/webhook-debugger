@@ -3,10 +3,17 @@ services:
     build: .
     ports:
       - "3000:3000"
+    read_only: true
     environment:
       DATA_DIR: /app/data
     volumes:
       - webhook_data:/app/data
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
 volumes:
