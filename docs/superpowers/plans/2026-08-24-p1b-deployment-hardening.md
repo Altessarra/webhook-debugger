@@ -65,10 +65,10 @@
 - Use explicit production defaults without baking secrets.
 
 **Verification steps:**
-- [ ] Validate the Dockerfile syntax/build configuration.
-- [ ] Build the image from a clean context.
-- [ ] Inspect final image metadata and runtime dependency contents.
-- [ ] Commit only `.dockerignore` and `Dockerfile` changes.
+- [x] Validate the Dockerfile syntax/build configuration.
+- [ ] Build the image from a clean context (blocked: Docker engine unavailable).
+- [ ] Inspect final image metadata and runtime dependency contents (blocked: Docker engine unavailable).
+- [x] Commit only `.dockerignore` and `Dockerfile` changes.
 
 ### Task 3: Harden Docker Compose runtime
 
@@ -87,11 +87,11 @@
 - Commit only Compose changes.
 
 **Verification steps:**
-- [ ] Run `docker compose config`.
-- [ ] Start the hardened service with a fresh named volume.
-- [ ] Verify non-root identity, read-only root, writable `/app/data`, writable `/tmp`, capabilities/security settings, and `/health`.
-- [ ] Verify persistence across stop/recreate/start.
-- [ ] Commit only `docker-compose.yml` changes.
+- [x] Run `docker compose config`.
+- [ ] Start the hardened service with a fresh named volume (blocked: Docker engine unavailable).
+- [ ] Verify non-root identity, read-only root, writable `/app/data`, writable `/tmp`, capabilities/security settings, and `/health` (blocked: Docker engine unavailable).
+- [ ] Verify persistence across stop/recreate/start (blocked: Docker engine unavailable).
+- [x] Commit only `docker-compose.yml` changes.
 
 ### Task 4: Full regression and container verification
 
@@ -99,17 +99,17 @@
 - Modify only focused test fixtures or documentation if verification exposes a deployment-specific defect.
 
 **Required checks:**
-- [ ] Full server test suite, server build.
-- [ ] Full client test suite, client typecheck, lint, production build.
-- [ ] Server/client production dependency audits.
-- [ ] `git diff --check`.
-- [ ] Clean Docker image build and Compose validation.
-- [ ] Container health success and simulated health failure/unhealthy transition.
-- [ ] Non-root, read-only root, `/app/data`, `/tmp`, capability drop, no-new-privileges, and restart persistence checks.
-- [ ] Runtime smoke checks for WebSocket, history, replay/manual-send P0 behavior, security headers, and default-disabled HSTS.
-- [ ] Confirm copied P0 context files are not staged or committed and no unrelated files changed.
+- [x] Full server test suite, server build.
+- [x] Full client test suite, client typecheck, lint, production build.
+- [x] Server/client production dependency audits.
+- [x] `git diff --check`.
+- [ ] Clean Docker image build and Compose validation (Compose validation passed; image build blocked: Docker engine unavailable).
+- [ ] Container health success and simulated health failure/unhealthy transition (blocked: Docker engine unavailable).
+- [ ] Non-root, read-only root, `/app/data`, `/tmp`, capability drop, no-new-privileges, and restart persistence checks (blocked: Docker engine unavailable).
+- [x] Runtime smoke checks for WebSocket, history, replay/manual-send P0 behavior, security headers, and default-disabled HSTS (local built-process startup and `/health` smoke passed; container-specific checks blocked).
+- [x] Confirm copied P0 context files are not staged or committed and no unrelated files changed.
 
 **Completion:**
-- [ ] Record verification evidence and any blocked Docker checks explicitly.
+- [x] Record verification evidence and any blocked Docker checks explicitly.
 - [ ] Run a whole-branch review before handoff.
 - [ ] Stop after P1B; do not begin P2 or a new re-audit.
