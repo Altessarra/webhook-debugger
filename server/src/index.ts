@@ -51,6 +51,7 @@ import {
   wsIdleTimeoutMs,
   wsMaxConnectionsPerIp,
   wsMaxPayloadBytes,
+  enableHsts,
 } from "./runtimeConfig";
 
 type RoutePolicy =
@@ -63,7 +64,25 @@ type RoutePolicy =
 type BuildServerOptions = {
   now?: () => number;
   rateLimits?: Partial<Record<RoutePolicy, number>>;
+  enableHsts?: boolean;
 };
+
+const securityHeaderValues = {
+  "X-Content-Type-Options": "nosniff",
+  "Referrer-Policy": "strict-origin-when-cross-origin",
+  "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+  "Content-Security-Policy":
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+};
+
+function getSecurityHeaders(hstsEnabled: boolean) {
+  return {
+    ...securityHeaderValues,
+    ...(hstsEnabled
+      ? { "Strict-Transport-Security": "max-age=31536000; includeSubDomains" }
+      : {}),
+  };
+}
 
 const defaultRateLimits: Record<RoutePolicy, number> = {
   "inbox-create": inboxCreationRateLimit,
@@ -109,15 +128,20 @@ function rejectWebSocketUpgrade(
   socket: Parameters<HttpServer["emit"]>[1],
   statusCode: number,
   statusText: string,
+  securityHeaders: Record<string, string>,
 ) {
+  const headerLines = Object.entries(securityHeaders)
+    .map(([name, value]) => `${name}: ${value}\r\n`)
+    .join("");
   socket.write(
-    `HTTP/1.1 ${statusCode} ${statusText}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+    `HTTP/1.1 ${statusCode} ${statusText}\r\n${headerLines}Connection: close\r\nContent-Length: 0\r\n\r\n`,
   );
   socket.destroy();
 }
 
 export function attachWebSocketServer(httpServer: HttpServer) {
   const allowedOrigin = process.env.CORS_ORIGIN || "http://localhost:5173";
+  const responseSecurityHeaders = getSecurityHeaders(enableHsts);
   const wss = new WebSocketServer({ noServer: true, maxPayload: wsMaxPayloadBytes });
   const connectionsByIp = new Map<string, number>();
   const sockets = new Set<WebSocket>();
@@ -152,26 +176,31 @@ export function attachWebSocketServer(httpServer: HttpServer) {
   ) => {
     const url = new URL(request.url ?? "/", "http://localhost");
     if (url.pathname !== "/") {
-      rejectWebSocketUpgrade(socket, 404, "Not Found");
+      rejectWebSocketUpgrade(socket, 404, "Not Found", responseSecurityHeaders);
       return;
     }
 
     const origin = request.headers.origin;
     if (origin !== undefined && origin !== allowedOrigin) {
-      rejectWebSocketUpgrade(socket, 403, "Forbidden");
+      rejectWebSocketUpgrade(socket, 403, "Forbidden", responseSecurityHeaders);
       return;
     }
 
     const inboxId = url.searchParams.get("inboxId");
     if (!inboxId || !getInbox(inboxId)) {
-      rejectWebSocketUpgrade(socket, 404, "Not Found");
+      rejectWebSocketUpgrade(socket, 404, "Not Found", responseSecurityHeaders);
       return;
     }
 
     const ip = request.socket.remoteAddress ?? "unknown";
     const connectionCount = connectionsByIp.get(ip) ?? 0;
     if (connectionCount >= wsMaxConnectionsPerIp) {
-      rejectWebSocketUpgrade(socket, 429, "Too Many Requests");
+      rejectWebSocketUpgrade(
+        socket,
+        429,
+        "Too Many Requests",
+        responseSecurityHeaders,
+      );
       return;
     }
 
@@ -208,7 +237,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
       });
     } catch {
       releaseConnection(ip);
-      rejectWebSocketUpgrade(socket, 400, "Bad Request");
+      rejectWebSocketUpgrade(socket, 400, "Bad Request", responseSecurityHeaders);
       return;
     }
 
@@ -251,6 +280,8 @@ function scheduleRetentionCleanup(fastify: FastifyInstance) {
 export function buildServer(options: BuildServerOptions = {}) {
   const fastify = Fastify({ logger: true });
   const allowedOrigin = process.env.CORS_ORIGIN || "http://localhost:5173";
+  const hstsEnabled = options.enableHsts ?? enableHsts;
+  const responseSecurityHeaders = getSecurityHeaders(hstsEnabled);
   const configuredLimits = { ...defaultRateLimits, ...options.rateLimits };
   const limiters = Object.fromEntries(
     (Object.keys(configuredLimits) as RoutePolicy[]).map((policy) => [
@@ -263,6 +294,31 @@ export function buildServer(options: BuildServerOptions = {}) {
       }),
     ]),
   ) as Record<RoutePolicy, FixedWindowLimiter>;
+
+  fastify.setErrorHandler((error, request, reply) => {
+    const statusCode =
+      typeof error === "object" &&
+      error !== null &&
+      "statusCode" in error &&
+      typeof error.statusCode === "number"
+        ? error.statusCode
+        : undefined;
+    if (statusCode !== undefined && statusCode < 500) {
+      return reply.code(statusCode).send({
+        error: error instanceof Error ? error.message : "Bad Request",
+      });
+    }
+
+    request.log.error(error);
+    return reply.code(500).send({ error: "Internal server error" });
+  });
+
+  fastify.addHook("onSend", async (_request, reply, payload) => {
+    for (const [name, value] of Object.entries(responseSecurityHeaders)) {
+      reply.header(name, value);
+    }
+    return payload;
+  });
 
   fastify.register(cors, { origin: allowedOrigin });
 
