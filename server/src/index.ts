@@ -13,6 +13,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { nanoid } from "nanoid";
 
 import {
+  checkDatabaseHealth,
   createInbox,
   decodeRequestCursor,
   deleteExpiredRequests,
@@ -338,6 +339,16 @@ export function buildServer(options: BuildServerOptions = {}) {
   if (fs.existsSync(publicRoot)) {
     fastify.register(fastifyStatic, { root: publicRoot });
   }
+
+  fastify.get("/health", async (_request, reply) => {
+    try {
+      checkDatabaseHealth();
+      return { status: "ok" };
+    } catch {
+      reply.code(503);
+      return { status: "unhealthy" };
+    }
+  });
 
   fastify.post("/api/inboxes", async (request, reply) => {
     if (rateLimit(limiters["inbox-create"], request.ip, reply)) {

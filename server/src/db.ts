@@ -82,6 +82,10 @@ export function getInbox(id: string) {
   return db.prepare("SELECT * FROM inboxes WHERE id = ?").get(id);
 }
 
+export function checkDatabaseHealth() {
+  db.prepare("SELECT 1").get();
+}
+
 export function insertRequest(req: {
   id: string;
   inboxId: string;
