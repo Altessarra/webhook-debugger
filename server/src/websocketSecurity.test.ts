@@ -4,7 +4,7 @@ import { afterEach, test } from "node:test";
 import { WebSocket, type ClientOptions } from "ws";
 
 import { createInbox } from "./db";
-import { attachWebSocketServer } from "./index";
+import { attachWebSocketServer, fastify, startServer } from "./index";
 
 const ownedServers: Array<http.Server> = [];
 const ownedSockets: WebSocket[] = [];
@@ -32,14 +32,18 @@ function createInboxId() {
   return id;
 }
 
-async function createTestServer() {
+async function createTestServerWithControl() {
   const server = http.createServer();
   ownedServers.push(server);
   cleanups.push(attachWebSocketServer(server));
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   assert.ok(address && typeof address !== "string");
-  return `ws://127.0.0.1:${address.port}`;
+  return { endpoint: `ws://127.0.0.1:${address.port}`, server };
+}
+
+async function createTestServer() {
+  return (await createTestServerWithControl()).endpoint;
 }
 
 type TestClientOptions = ClientOptions & { autoPong?: boolean };
@@ -69,6 +73,17 @@ function rejectsUpgrade(socket: WebSocket) {
       response.resume();
       resolve(response.statusCode ?? 0);
     });
+    socket.once("error", () => resolve(0));
+  });
+}
+
+function upgradeOutcome(socket: WebSocket) {
+  return new Promise<number | "open">((resolve) => {
+    socket.once("unexpected-response", (_request, response) => {
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    socket.once("open", () => resolve("open"));
     socket.once("error", () => resolve(0));
   });
 }
@@ -143,6 +158,40 @@ test("rejects the eleventh concurrent subscription from one IP and releases the 
   await opens(replacement);
 });
 
+test("keeps existing IP reservations when an upgrade handler throws", async () => {
+  const { endpoint, server } = await createTestServerWithControl();
+  const inboxId = createInboxId();
+  let capturedRequest: http.IncomingMessage | undefined;
+  let capturedSocket: import("node:stream").Duplex | undefined;
+  let capturedHead: Buffer | undefined;
+  server.once("upgrade", (request, socket, head) => {
+    capturedRequest = request;
+    capturedSocket = socket;
+    capturedHead = head;
+  });
+
+  const existing = connect(`${endpoint}/?inboxId=${inboxId}`);
+  await opens(existing);
+  assert.ok(capturedRequest && capturedSocket && capturedHead);
+
+  const originalWrite = capturedSocket.write;
+  const originalDestroy = capturedSocket.destroy;
+  capturedSocket.write = (() => true) as typeof capturedSocket.write;
+  capturedSocket.destroy = (() => capturedSocket) as typeof capturedSocket.destroy;
+  try {
+    server.emit("upgrade", capturedRequest, capturedSocket, capturedHead);
+  } finally {
+    capturedSocket.write = originalWrite;
+    capturedSocket.destroy = originalDestroy;
+  }
+
+  for (let index = 0; index < 9; index += 1) {
+    await opens(connect(`${endpoint}/?inboxId=${inboxId}`));
+  }
+  const overLimit = connect(`${endpoint}/?inboxId=${inboxId}`);
+  assert.equal(await upgradeOutcome(overLimit), 429);
+});
+
 test("enforces the configured payload cap before registering client data", async () => {
   const endpoint = await createTestServer();
   const socket = connect(`${endpoint}/?inboxId=${createInboxId()}`);
@@ -165,7 +214,7 @@ test("closes client messages because subscriptions are server-push only", async 
   assert.equal((await closed).code, 1008);
 });
 
-test("keeps a connection alive when it replies to heartbeat pings", async () => {
+test("refreshes liveness after a pong across a later heartbeat cutoff", async () => {
   const heartbeat = controlHeartbeat();
   timerRestores.push(heartbeat.restore);
   const endpoint = await createTestServer();
@@ -175,6 +224,12 @@ test("keeps a connection alive when it replies to heartbeat pings", async () => 
   const ping = new Promise<void>((resolve) => socket.once("ping", () => resolve()));
   heartbeat.advance();
   await ping;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const laterPing = new Promise<void>((resolve) => socket.once("ping", () => resolve()));
+  heartbeat.advance();
+  await laterPing;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  heartbeat.advance();
   assert.equal(socket.readyState, WebSocket.OPEN);
 });
 
@@ -204,4 +259,29 @@ test("removes an empty subscriber set when the final socket closes", async () =>
 
   const replacement = connect(`${endpoint}/?inboxId=${inboxId}`);
   await opens(replacement);
+});
+
+test("production bootstrap removes the WebSocket handler during Fastify shutdown", async () => {
+  const originalListen = fastify.listen;
+  const originalLog = console.log;
+  let listened = false;
+  fastify.listen = (async () => {
+    listened = true;
+    return "http://127.0.0.1:0";
+  }) as typeof fastify.listen;
+  console.log = () => undefined;
+
+  try {
+    await startServer();
+    assert.equal(listened, true);
+    assert.equal(fastify.server.listenerCount("upgrade"), 1);
+
+    await fastify.close();
+
+    assert.equal(fastify.server.listenerCount("upgrade"), 0);
+  } finally {
+    fastify.listen = originalListen;
+    console.log = originalLog;
+    fastify.server.removeAllListeners("upgrade");
+  }
 });

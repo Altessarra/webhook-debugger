@@ -122,6 +122,11 @@ export function attachWebSocketServer(httpServer: HttpServer) {
   const connectionsByIp = new Map<string, number>();
   const sockets = new Set<WebSocket>();
   const socketCleanups = new Map<WebSocket, () => void>();
+  const releaseConnection = (ip: string) => {
+    const currentCount = connectionsByIp.get(ip) ?? 0;
+    if (currentCount <= 1) connectionsByIp.delete(ip);
+    else connectionsByIp.set(ip, currentCount - 1);
+  };
 
   const heartbeat = setInterval(() => {
     const now = Date.now();
@@ -190,9 +195,7 @@ export function attachWebSocketServer(httpServer: HttpServer) {
           subscribers.delete(webSocket);
           if (subscribers.size === 0) inboxSubscribers.delete(inboxId);
 
-          const currentCount = connectionsByIp.get(ip) ?? 0;
-          if (currentCount <= 1) connectionsByIp.delete(ip);
-          else connectionsByIp.set(ip, currentCount - 1);
+          releaseConnection(ip);
         };
 
         socketCleanups.set(webSocket, cleanup);
@@ -204,15 +207,13 @@ export function attachWebSocketServer(httpServer: HttpServer) {
         webSocket.on("error", cleanup);
       });
     } catch {
-      connectionsByIp.delete(ip);
+      releaseConnection(ip);
       rejectWebSocketUpgrade(socket, 400, "Bad Request");
       return;
     }
 
     if (!upgraded) {
-      const currentCount = connectionsByIp.get(ip) ?? 0;
-      if (currentCount <= 1) connectionsByIp.delete(ip);
-      else connectionsByIp.set(ip, currentCount - 1);
+      releaseConnection(ip);
     }
   };
 
@@ -524,7 +525,8 @@ export const fastify = buildServer();
 export async function startServer() {
   try {
     await fastify.listen({ port: 3000, host: "0.0.0.0" });
-    attachWebSocketServer(fastify.server);
+    const cleanupWebSocketServer = attachWebSocketServer(fastify.server);
+    fastify.addHook("onClose", cleanupWebSocketServer);
     scheduleRetentionCleanup(fastify);
     console.log("Server running on http://localhost:3000");
   } catch (err) {
