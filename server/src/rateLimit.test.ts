@@ -85,7 +85,12 @@ test("refuses new keys when the bounded key store is full", () => {
   });
 
   assert.equal(limiter.check("first").allowed, true);
-  assert.equal(limiter.check("second").allowed, false);
+  now = 1_900;
+  assert.deepEqual(limiter.check("second"), {
+    allowed: false,
+    remaining: 0,
+    retryAfterSeconds: 60,
+  });
   now = 61_000;
   assert.deepEqual(limiter.check("second"), { allowed: true, remaining: 1 });
 });

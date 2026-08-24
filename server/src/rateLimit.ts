@@ -35,7 +35,21 @@ export class FixedWindowLimiter {
     let state = this.windows.get(key);
     if (!state) {
       if (this.windows.size >= this.maxKeys) {
-        return { allowed: false, remaining: 0, retryAfterSeconds: 1 };
+        let earliestWindowEnd = Number.POSITIVE_INFINITY;
+        for (const activeState of this.windows.values()) {
+          earliestWindowEnd = Math.min(
+            earliestWindowEnd,
+            activeState.windowStart + this.windowMs,
+          );
+        }
+        return {
+          allowed: false,
+          remaining: 0,
+          retryAfterSeconds: Math.max(
+            1,
+            Math.ceil((earliestWindowEnd - currentTime) / 1000),
+          ),
+        };
       }
       state = { windowStart: currentTime, count: 0 };
       this.windows.set(key, state);
