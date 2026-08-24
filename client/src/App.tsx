@@ -20,6 +20,7 @@ import {
 import { PaneResizeHandle } from "./components/PaneResizeHandle";
 import { RequestHistory } from "./components/RequestHistory";
 import { SchemaViewer } from "./components/SchemaViewer";
+import { SensitiveHeadersViewer } from "./components/SensitiveHeadersViewer";
 import { uiCopy } from "./data/content";
 import { Code } from "./pages/Code";
 import { Help } from "./pages/Help";
@@ -35,6 +36,7 @@ import { parseJsonValue } from "./utils/json";
 import { addInboxId, parseInboxIds } from "./utils/inboxSession";
 import { resizePaneWidth } from "./utils/paneResize";
 import { appendRequestPage } from "./utils/requestPagination";
+import { maskSensitiveHeaders } from "./utils/sensitiveHeaders";
 import { nextPayloadFormat, type PayloadFormat } from "./utils/uiState";
 
 const API_URL = "";
@@ -90,6 +92,30 @@ function formatBytes(value: string | null) {
   const bytes = new TextEncoder().encode(value).length;
   if (bytes < 1024) return `${bytes} B`;
   return `${(bytes / 1024).toFixed(2)} KB`;
+}
+
+function asStringRecord(value: unknown): Record<string, string> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+
+  const entries = Object.entries(value);
+  if (entries.some(([, item]) => typeof item !== "string")) {
+    return null;
+  }
+
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function getHeaderValue(
+  headers: Record<string, string> | null,
+  name: string,
+): string | undefined {
+  if (!headers) return undefined;
+  const normalizedName = name.toLowerCase();
+  return Object.entries(headers).find(
+    ([headerName]) => headerName.toLowerCase() === normalizedName,
+  )?.[1];
 }
 
 function getInitialInboxIds() {
@@ -206,6 +232,8 @@ function App() {
   const [payloadTab, setPayloadTab] = useState<PayloadTab>("payload");
   const [payloadFormat, setPayloadFormat] = useState<PayloadFormat>("pretty");
   const [paused, setPaused] = useState(false);
+  const [revealedSensitiveHeaders, setRevealedSensitiveHeaders] =
+    useState(false);
   const [initialPaneWidths] = useState(getInitialPaneWidths);
   const [paneWidths, setPaneWidths] = useState(initialPaneWidths);
   const workbenchRef = useRef<HTMLDivElement | null>(null);
@@ -344,6 +372,7 @@ function App() {
       setRequests([]);
       setNextHistoryCursor(null);
       setSelected(null);
+      setRevealedSensitiveHeaders(false);
     };
     window.addEventListener("webhook-debugger:pause", handlePause);
     window.addEventListener(
@@ -586,6 +615,7 @@ function App() {
     setSelected(request);
     setDetailTab("overview");
     setPayloadTab("payload");
+    setRevealedSensitiveHeaders(false);
     setReplayResult(null);
     setVerifyResult(null);
     setStripeSecret("");
@@ -598,6 +628,7 @@ function App() {
       setRequests([]);
       setNextHistoryCursor(null);
       setSelected(null);
+      setRevealedSensitiveHeaders(false);
       setError(null);
       setInboxId(nextInboxId);
       navigate("/requests");
@@ -662,7 +693,10 @@ function App() {
         string,
         string
       > | null;
-      const signatureHeader = headers?.["stripe-signature"];
+      const signatureHeader = getHeaderValue(
+        asStringRecord(headers),
+        "stripe-signature",
+      );
       if (!signatureHeader) {
         setVerifyResult({
           valid: false,
@@ -822,13 +856,23 @@ function App() {
   if (location.pathname === "/") return <Navigate to="/requests" replace />;
 
   const selectedHeaders = selected
-    ? (parseJsonValue(selected.headers) as Record<string, string> | null)
+    ? asStringRecord(parseJsonValue(selected.headers))
     : null;
+  const displayedHeaders = selected
+    ? asStringRecord(
+        parseJsonValue(
+          maskSensitiveHeaders(selected.headers, revealedSensitiveHeaders),
+        ),
+      )
+    : null;
+  const displayedHeaderText = selected
+    ? maskSensitiveHeaders(selected.headers, revealedSensitiveHeaders)
+    : "";
   const query = selected
     ? (parseJsonValue(selected.query) as Record<string, string> | null)
     : null;
-  const hasStripeSignature = !!selectedHeaders?.["stripe-signature"];
-  const headerEntries = selectedHeaders ? Object.entries(selectedHeaders) : [];
+  const hasStripeSignature = !!getHeaderValue(selectedHeaders, "stripe-signature");
+  const headerEntries = displayedHeaders ? Object.entries(displayedHeaders) : [];
 
   const renderOverview = () => (
     <>
@@ -845,18 +889,18 @@ function App() {
           <div>
             <span>Source IP</span>
             <code>
-              {selectedHeaders?.["x-forwarded-for"] ??
-                selectedHeaders?.["x-real-ip"] ??
+              {getHeaderValue(displayedHeaders, "x-forwarded-for") ??
+                getHeaderValue(displayedHeaders, "x-real-ip") ??
                 "—"}
             </code>
           </div>
           <div>
             <span>User Agent</span>
-            <code>{selectedHeaders?.["user-agent"] ?? "—"}</code>
+            <code>{getHeaderValue(displayedHeaders, "user-agent") ?? "—"}</code>
           </div>
           <div>
             <span>Content Type</span>
-            <code>{selectedHeaders?.["content-type"] ?? "—"}</code>
+            <code>{getHeaderValue(displayedHeaders, "content-type") ?? "—"}</code>
           </div>
           <div>
             <span>Content Length</span>
@@ -926,7 +970,13 @@ function App() {
     if (detailTab === "headers")
       return (
         <MetaSection title="All headers">
-          <JsonViewer value={selected?.headers} />
+          <SensitiveHeadersViewer
+            headers={selected?.headers}
+            revealed={revealedSensitiveHeaders}
+            onToggleReveal={() =>
+              setRevealedSensitiveHeaders((current) => !current)
+            }
+          />
         </MetaSection>
       );
     if (detailTab === "query")
@@ -943,7 +993,7 @@ function App() {
         <MetaSection title="Raw request">
           <pre className="raw-request">
             {selected?.method} {selected?.path}\n
-            {selectedHeaders ? JSON.stringify(selectedHeaders, null, 2) : ""}
+            {displayedHeaderText}
             \n\n{selected?.body ?? ""}
           </pre>
         </MetaSection>
