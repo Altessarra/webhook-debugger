@@ -17,24 +17,26 @@ docs/
 
 client/tests/
 server/src/tests/
-server/src/*.test.ts
+client/src/**/*.test.ts
+client/src/**/*.test.tsx
+server/src/**/*.test.ts
+server/src/**/*.test.tsx
 
-*.db
-*.db-*
-*.sqlite
-*.sqlite3
-*.sqlite3-*
-*.wal
-*.shm
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite*
+**/*.wal
+**/*.shm
 
-.env
-.env.*
-!.env.example
-*.pem
-*.key
-*.crt
-*.p12
-*.pfx
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
 
 .DS_Store
 Thumbs.db
