@@ -283,27 +283,57 @@ test("removes an empty subscriber set when the final socket closes", async () =>
   await opens(replacement);
 });
 
-test("production bootstrap removes the WebSocket handler during Fastify shutdown", async () => {
+test("production bootstrap registers shutdown hooks before listening", async () => {
   const originalListen = fastify.listen;
   const originalLog = console.log;
-  let listened = false;
-  fastify.listen = (async () => {
-    listened = true;
-    return "http://127.0.0.1:0";
-  }) as typeof fastify.listen;
+  const originalExit = process.exit;
+  const originalError = fastify.log.error;
+  const listenOnEphemeralPort = originalListen as unknown as (options: {
+    port: number;
+    host: string;
+  }) => Promise<string>;
+  const loggedErrors: unknown[] = [];
+  let exitCode: number | undefined;
+
+  fastify.listen = (async function listenWithEphemeralPort() {
+    return listenOnEphemeralPort.call(fastify, { port: 0, host: "127.0.0.1" });
+  }) as unknown as typeof fastify.listen;
   console.log = () => undefined;
+  process.exit = ((code?: number) => {
+    exitCode = code;
+    throw new Error("__startServer_exit__");
+  }) as typeof process.exit;
+  fastify.log.error = ((error: unknown) => {
+    loggedErrors.push(error);
+    return fastify.log;
+  }) as typeof fastify.log.error;
 
   try {
     await startServer();
-    assert.equal(listened, true);
+    assert.equal(exitCode, undefined);
+    assert.deepEqual(loggedErrors, []);
+    assert.equal(fastify.server.listening, true);
     assert.equal(fastify.server.listenerCount("upgrade"), 1);
 
     await fastify.close();
 
     assert.equal(fastify.server.listenerCount("upgrade"), 0);
+  } catch (error) {
+    if (error instanceof Error && error.message === "__startServer_exit__") {
+      const startupError = loggedErrors[0] as { code?: string } | undefined;
+      assert.fail(
+        `startServer exited with ${exitCode ?? "undefined"} after ${startupError?.code ?? "unknown startup error"}`,
+      );
+    }
+    throw error;
   } finally {
     fastify.listen = originalListen;
     console.log = originalLog;
+    process.exit = originalExit;
+    fastify.log.error = originalError;
     fastify.server.removeAllListeners("upgrade");
+    if (fastify.server.listening) {
+      await fastify.close();
+    }
   }
 });
