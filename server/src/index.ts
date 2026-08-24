@@ -4,6 +4,7 @@ import Fastify, {
   type FastifyRequest,
 } from "fastify";
 import fs from "fs";
+import type { Server as HttpServer, IncomingMessage } from "node:http";
 import path from "path";
 import fastifyStatic from "@fastify/static";
 import cors from "@fastify/cors";
@@ -46,6 +47,10 @@ import {
   requestRetentionHours,
   retentionCleanupIntervalMs,
   webhookIngestionRateLimit,
+  wsHeartbeatIntervalMs,
+  wsIdleTimeoutMs,
+  wsMaxConnectionsPerIp,
+  wsMaxPayloadBytes,
 } from "./runtimeConfig";
 
 type RoutePolicy =
@@ -100,23 +105,128 @@ function rateLimit(
   return true;
 }
 
-function addWebSocketServer(fastify: FastifyInstance) {
-  const wss = new WebSocketServer({ server: fastify.server });
+function rejectWebSocketUpgrade(
+  socket: Parameters<HttpServer["emit"]>[1],
+  statusCode: number,
+  statusText: string,
+) {
+  socket.write(
+    `HTTP/1.1 ${statusCode} ${statusText}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+  );
+  socket.destroy();
+}
 
-  wss.on("connection", (socket, req) => {
-    const url = new URL(req.url ?? "", "http://localhost");
-    const inboxId = url.searchParams.get("inboxId");
-    if (!inboxId) {
-      socket.close();
+export function attachWebSocketServer(httpServer: HttpServer) {
+  const allowedOrigin = process.env.CORS_ORIGIN || "http://localhost:5173";
+  const wss = new WebSocketServer({ noServer: true, maxPayload: wsMaxPayloadBytes });
+  const connectionsByIp = new Map<string, number>();
+  const sockets = new Set<WebSocket>();
+  const socketCleanups = new Map<WebSocket, () => void>();
+
+  const heartbeat = setInterval(() => {
+    const now = Date.now();
+    for (const socket of sockets) {
+      const lastPongAt = (socket as WebSocket & { lastPongAt?: number }).lastPongAt;
+      if (
+        socket.readyState !== WebSocket.OPEN ||
+        lastPongAt === undefined ||
+        now - lastPongAt >= wsIdleTimeoutMs
+      ) {
+        socket.terminate();
+        continue;
+      }
+      socket.ping();
+    }
+  }, wsHeartbeatIntervalMs);
+  heartbeat.unref();
+
+  const onUpgrade = (
+    request: IncomingMessage,
+    socket: Parameters<HttpServer["emit"]>[1],
+    head: Buffer,
+  ) => {
+    const url = new URL(request.url ?? "/", "http://localhost");
+    if (url.pathname !== "/") {
+      rejectWebSocketUpgrade(socket, 404, "Not Found");
       return;
     }
 
-    if (!inboxSubscribers.has(inboxId)) {
-      inboxSubscribers.set(inboxId, new Set());
+    const origin = request.headers.origin;
+    if (origin !== undefined && origin !== allowedOrigin) {
+      rejectWebSocketUpgrade(socket, 403, "Forbidden");
+      return;
     }
-    inboxSubscribers.get(inboxId)!.add(socket);
-    socket.on("close", () => inboxSubscribers.get(inboxId)?.delete(socket));
-  });
+
+    const inboxId = url.searchParams.get("inboxId");
+    if (!inboxId || !getInbox(inboxId)) {
+      rejectWebSocketUpgrade(socket, 404, "Not Found");
+      return;
+    }
+
+    const ip = request.socket.remoteAddress ?? "unknown";
+    const connectionCount = connectionsByIp.get(ip) ?? 0;
+    if (connectionCount >= wsMaxConnectionsPerIp) {
+      rejectWebSocketUpgrade(socket, 429, "Too Many Requests");
+      return;
+    }
+
+    connectionsByIp.set(ip, connectionCount + 1);
+    let upgraded = false;
+    try {
+      wss.handleUpgrade(request, socket, head, (webSocket) => {
+        upgraded = true;
+        sockets.add(webSocket);
+        const subscribers = inboxSubscribers.get(inboxId) ?? new Set<WebSocket>();
+        inboxSubscribers.set(inboxId, subscribers);
+        subscribers.add(webSocket);
+        (webSocket as WebSocket & { lastPongAt?: number }).lastPongAt = Date.now();
+
+        let cleaned = false;
+        const cleanup = () => {
+          if (cleaned) return;
+          cleaned = true;
+          sockets.delete(webSocket);
+          socketCleanups.delete(webSocket);
+          subscribers.delete(webSocket);
+          if (subscribers.size === 0) inboxSubscribers.delete(inboxId);
+
+          const currentCount = connectionsByIp.get(ip) ?? 0;
+          if (currentCount <= 1) connectionsByIp.delete(ip);
+          else connectionsByIp.set(ip, currentCount - 1);
+        };
+
+        socketCleanups.set(webSocket, cleanup);
+        webSocket.on("pong", () => {
+          (webSocket as WebSocket & { lastPongAt?: number }).lastPongAt = Date.now();
+        });
+        webSocket.on("message", () => webSocket.close(1008, "Server-push only"));
+        webSocket.on("close", cleanup);
+        webSocket.on("error", cleanup);
+      });
+    } catch {
+      connectionsByIp.delete(ip);
+      rejectWebSocketUpgrade(socket, 400, "Bad Request");
+      return;
+    }
+
+    if (!upgraded) {
+      const currentCount = connectionsByIp.get(ip) ?? 0;
+      if (currentCount <= 1) connectionsByIp.delete(ip);
+      else connectionsByIp.set(ip, currentCount - 1);
+    }
+  };
+
+  httpServer.on("upgrade", onUpgrade);
+
+  return () => {
+    clearInterval(heartbeat);
+    httpServer.off("upgrade", onUpgrade);
+    for (const socket of sockets) {
+      socket.terminate();
+      socketCleanups.get(socket)?.();
+    }
+    wss.close();
+  };
 }
 
 export function runRetentionCleanup(fastify: FastifyInstance) {
@@ -414,7 +524,7 @@ export const fastify = buildServer();
 export async function startServer() {
   try {
     await fastify.listen({ port: 3000, host: "0.0.0.0" });
-    addWebSocketServer(fastify);
+    attachWebSocketServer(fastify.server);
     scheduleRetentionCleanup(fastify);
     console.log("Server running on http://localhost:3000");
   } catch (err) {
