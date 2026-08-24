@@ -18,10 +18,21 @@ test("matches sensitive header names case-insensitively", () => {
   assert.equal(isSensitiveHeader("content-type"), false);
 });
 
+test("matches generic credential-bearing header names without broad substring matching", () => {
+  assert.equal(isSensitiveHeader("x-client-secret"), true);
+  assert.equal(isSensitiveHeader("X-Password"), true);
+  assert.equal(isSensitiveHeader("x-private-key"), true);
+  assert.equal(isSensitiveHeader("x-service-credentials"), true);
+  assert.equal(isSensitiveHeader("x-secretary"), false);
+  assert.equal(isSensitiveHeader("x-debug-token-count"), false);
+  assert.equal(isSensitiveHeader("x-request-id"), false);
+});
+
 test("masks only sensitive header values while leaving ordinary headers readable", () => {
   const rawHeaders = JSON.stringify(
     {
       Authorization: "Bearer super-secret",
+      "x-client-secret": "client-secret",
       "content-type": "application/json",
       "Stripe-Signature": "t=1,v1=abc123",
       "x-request-id": "req_123",
@@ -34,6 +45,7 @@ test("masks only sensitive header values while leaving ordinary headers readable
 
   assert.deepEqual(JSON.parse(masked), {
     Authorization: "[REDACTED]",
+    "x-client-secret": "[REDACTED]",
     "content-type": "application/json",
     "Stripe-Signature": "[REDACTED]",
     "x-request-id": "req_123",

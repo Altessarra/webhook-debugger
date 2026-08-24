@@ -27,6 +27,8 @@ const EXACT_SENSITIVE_HEADERS = new Set([
 
 const TOKEN_HEADER_PATTERN =
   /(^|[-_])(?:access|api|auth|bearer|id|refresh|session)[-_]?(?:key|token|secret)($|[-_])/i;
+const GENERIC_CREDENTIAL_HEADER_PATTERN =
+  /(^|[-_])(?:secret|password|passphrase|credentials?|private[-_]?key)($|[-_])/i;
 const WEBHOOK_SIGNATURE_PATTERN =
   /(^|[-_])(?:hub|slack|stripe|svix|shopify|twilio|paddle|razorpay|webhook)[-_].*(?:hmac|signature)|(^|[-_])(?:hub|slack|stripe|svix|shopify|twilio|paddle|razorpay|webhook)[-_](?:hmac|signature)($|[-_])/i;
 
@@ -41,6 +43,7 @@ export function isSensitiveHeader(name: string): boolean {
   return (
     EXACT_SENSITIVE_HEADERS.has(normalizedName) ||
     TOKEN_HEADER_PATTERN.test(normalizedName) ||
+    GENERIC_CREDENTIAL_HEADER_PATTERN.test(normalizedName) ||
     WEBHOOK_SIGNATURE_PATTERN.test(normalizedName)
   );
 }
